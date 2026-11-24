@@ -102,8 +102,16 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         default=None,
         help="Path to write markdown summary (defaults to $GITHUB_STEP_SUMMARY if unset)",
     )
+    parser.add_argument(
+        "--baseline-timeout",
+        type=float,
+        default=None,
+        help="Baseline test execution timeout in seconds (defaults to 15s; increase for heavy DB/app fixtures)",
+    )
 
     args = parser.parse_args(argv)
+    if args.baseline_timeout is not None and args.baseline_timeout <= 0:
+        parser.error("--baseline-timeout must be > 0")
 
     repo_dir = args.repo.resolve()
     base_ref = args.base
@@ -114,6 +122,7 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         repo_dir,
         base_ref,
         head_ref,
+        **({"baseline_timeout_s": args.baseline_timeout} if args.baseline_timeout is not None else {}),
         **({"native_pythons": native_pythons} if native_pythons is not None else {}),
     )
 

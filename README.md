@@ -37,6 +37,8 @@ Switch `mode: enforce` to hard-block merges (`exit 2`) only when a deterministic
 ```bash
 python3 -m pip install --no-deps .
 nocheat-gate --repo . --base main --head HEAD --mode observe --json
+# For slow DB/app test fixtures (>15s startup):
+nocheat-gate --repo . --base main --head HEAD --mode observe --baseline-timeout 45
 ```
 
 ---
@@ -81,6 +83,15 @@ Evaluated across `83` genuine public Python artifacts (`Sengim/impossiblebench-r
 | `BLOCK` | Confirmed contract counterexample, test-weakening / deletion witness, concurrency witness, or severe mutation survival. | `0` | `2` |
 | `ABSTAIN` | Inconclusive contract (including same-PR contract edits), literal bypass guard, degraded test with zero mutants, low-kill band, missing tests for executable diffs, or 120s budget cap. | `0` | `0` |
 | `BASELINE_FAIL` | The candidate PR's baseline test suite failed before mutation checks could run. | `0` | `1` |
+
+---
+
+## Zero-Config vs. Explicit Contracts & CI Hardening
+
+- **Day-1 Zero-Config Mode (no `.nocheat-contracts.json`):** Catches Tier-0 test tampering (`POD001–POD005`), single-literal bypass guards, severe diff-mutation survival (`<30%` `BLOCK`, `30–45%` `ABSTAIN`), non-idempotence, and concurrency races. It does **not** infer domain formulas automatically—partial coverage (`>=45%` without test degradation) or untouched-test `oneoff` shortcuts can still pass.
+- **Explicit Contract Mode (`.nocheat-contracts.json` pinned at `base`):** Adds deterministic differential counterexamples (`CONTRACT_COUNTEREXAMPLE`, as shown in `PR #1`).
+- **Heavy Backend Fixtures (`baseline-timeout`):** Increase `baseline-timeout: '45'` (or `--baseline-timeout 45`) when app or database fixture startup exceeds the `15s` baseline default.
+- **CI Trust Boundary (`CODEOWNERS` + Rulesets):** Candidate `pytest` runs arbitrary PR code inside the `pull_request` runner. Protect `.github/workflows/` and `.nocheat-contracts.json` via `CODEOWNERS` + GitHub Branch Rulesets (pinning the required check job name), and never mount signing keys or production secrets inside untrusted `pull_request` jobs.
 
 ---
 

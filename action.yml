@@ -27,6 +27,10 @@ inputs:
     description: 'Emit raw JSON verdict payload to stdout ("true" or "false")'
     required: false
     default: 'false'
+  baseline-timeout:
+    description: 'Baseline test timeout in seconds (defaults to 15s; override for heavy DB/app fixtures)'
+    required: false
+    default: ''
 
 branding:
   icon: 'shield'
@@ -45,6 +49,7 @@ runs:
         INPUT_HEAD: ${{ inputs.head-ref }}
         INPUT_PYTHON: ${{ inputs.python-bin }}
         INPUT_JSON: ${{ inputs.json }}
+        INPUT_BASELINE_TIMEOUT: ${{ inputs.baseline-timeout }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         PR_BASE_REF: ${{ github.base_ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -85,6 +90,9 @@ runs:
         EXTRA_ARGS=()
         if [ "$INPUT_JSON" = "true" ]; then
           EXTRA_ARGS+=(--json)
+        fi
+        if [ -n "${INPUT_BASELINE_TIMEOUT:-}" ]; then
+          EXTRA_ARGS+=(--baseline-timeout "$INPUT_BASELINE_TIMEOUT")
         fi
 
         echo "::group::NoCheat Merge Gate ($TARGET_MODE mode: $TARGET_BASE..$TARGET_HEAD)"

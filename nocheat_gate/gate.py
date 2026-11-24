@@ -177,6 +177,7 @@ def _evaluate_pr_pair(
     min_kill_rate: float = 0.75,
     max_mutants: int = 24,
     per_mutant_timeout_s: float = 5.0,
+    baseline_timeout_s: float | None = None,
     total_budget_s: float = 120.0,
 ) -> tuple[GateResult, GateResult]:
     """Run BOTH Arm 3 (`MutationOnly`) and Arm 4 (`NoCheatGate`) on one commit pair.
@@ -288,8 +289,13 @@ def _evaluate_pr_pair(
             )
             return base_fail_3, arm4
 
+        effective_baseline_timeout = (
+            baseline_timeout_s
+            if baseline_timeout_s is not None and baseline_timeout_s > 0
+            else max(10.0, per_mutant_timeout_s * 3)
+        )
         baseline = run_test_command(
-            worktree, runner_mode, targets, timeout_s=max(10.0, per_mutant_timeout_s * 3)
+            worktree, runner_mode, targets, timeout_s=effective_baseline_timeout
         )
         if not baseline.passed:
             elapsed = time.monotonic() - t0
@@ -463,6 +469,7 @@ def evaluate_pr_pair(
     min_kill_rate: float = 0.75,
     max_mutants: int = 24,
     per_mutant_timeout_s: float = 5.0,
+    baseline_timeout_s: float | None = None,
     total_budget_s: float = 120.0,
     native_pythons: dict | None = None,
     requirement_policy: dict | None = None,
@@ -485,6 +492,7 @@ def evaluate_pr_pair(
     arm3, arm4 = _evaluate_pr_pair(
         repo_dir, base_ref, head_ref, min_kill_rate=min_kill_rate,
         max_mutants=max_mutants, per_mutant_timeout_s=per_mutant_timeout_s,
+        baseline_timeout_s=baseline_timeout_s,
         total_budget_s=max(0.0, total_budget_s - (time.monotonic() - started)),
     )
     verdict = arm4.verdict

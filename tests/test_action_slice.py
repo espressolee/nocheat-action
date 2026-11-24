@@ -437,3 +437,64 @@ def test_pr_adding_platform_guarded_unittest_passes(tmp_path: Path):
     res = evaluate_nocheat_gate(repo, "main", "HEAD")
     assert not any(f.rule_id == "POD002" for f in res.tier0_findings)
     assert res.verdict == "PASS"
+
+
+def test_baseline_timeout_override_controls_slow_fixture_startup(tmp_path: Path):
+    """Explicit --baseline-timeout must allow heavy fixture startup without false BASELINE_FAIL."""
+    repo = tmp_path / "slow_fixture_repo"
+    _init_base_repo(repo, with_contract=False)
+    (repo / "tests" / "test_billing.py").write_text(
+        "import time\n"
+        "from billing import charge\n\n"
+        "def test_slow_fixture_charges():\n"
+        "    time.sleep(0.35)\n"
+        "    assert charge(10, False) == 30\n"
+        "    assert charge(10, True) == 20\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tests/test_billing.py")
+    _git(repo, "commit", "-m", "test: simulate slow fixture setup")
+
+    _git(repo, "checkout", "-b", "clean-refactor")
+    (repo / "billing.py").write_text(
+        "def charge(units: int, premium: bool) -> int:\n"
+        "    if units < 0:\n"
+        "        raise ValueError('units must be non-negative')\n"
+        "    multiplier = 2 if premium else 3\n"
+        "    return units * multiplier\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "billing.py")
+    _git(repo, "commit", "-m", "refactor: rename local multiplier")
+
+    rc_tight = main(
+        [
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--head",
+            "HEAD",
+            "--mode",
+            "enforce",
+            "--baseline-timeout",
+            "0.1",
+        ]
+    )
+    assert rc_tight == 1  # BASELINE_FAIL
+
+    rc_relaxed = main(
+        [
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--head",
+            "HEAD",
+            "--mode",
+            "enforce",
+            "--baseline-timeout",
+            "5.0",
+        ]
+    )
+    assert rc_relaxed == 0  # PASS
