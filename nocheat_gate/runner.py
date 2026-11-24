@@ -90,7 +90,19 @@ def _find_pytest_targets(
     targets: list[str] = []
     from .impact import analyze_impact
     impact = analyze_impact(worktree, prod_files, scopes)
-    targets.extend(impact.tests)
+    if not impact.fallback:
+        targets.extend(impact.tests)
+    else:
+        known_tests = set(impact.tests)
+        targets.extend(
+            sorted(
+                {
+                    key.split(":", 1)[0]
+                    for key in impact.impacted
+                    if key.split(":", 1)[0] in known_tests
+                }
+            )
+        )
     for tf in test_files:
         if tf.status != "D" and (worktree / tf.rel_path).exists():
             targets.append(tf.rel_path)

@@ -342,3 +342,43 @@ def test_action_yml_shell_execution_on_live_demo_repos(tmp_path: Path):
     assert p3_enf.returncode == 2
     assert summary.exists()
     assert "NoCheat Merge Gate" in summary.read_text(encoding="utf-8")
+
+
+def test_impact_fallback_does_not_pull_unrelated_slow_tests(tmp_path: Path):
+    """Unrelated @dataclass files must not force whole-repo test fallback on a scoped PR."""
+    repo = tmp_path / "scoped_repo"
+    _init_base_repo(repo, with_contract=True)
+    # Add an unrelated decorated module + unrelated test file that would fail/slow down if selected
+    (repo / "unrelated_model.py").write_text(
+        "from dataclasses import dataclass\n\n"
+        "@dataclass(frozen=True)\n"
+        "class Meta:\n"
+        "    tag: str\n",
+        encoding="utf-8",
+    )
+    (repo / "tests" / "test_unrelated_slow.py").write_text(
+        "def test_should_not_be_selected():\n"
+        "    raise AssertionError('unrelated test suite should not run for billing.py diff')\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base: add unrelated dataclass and unrelated test")
+
+    _git(repo, "checkout", "-b", "edit-billing-only")
+    (repo / "billing.py").write_text(
+        "def charge(units: int, premium: bool) -> int:\n"
+        "    if units < 0:\n"
+        "        raise ValueError('units must be non-negative')\n"
+        "    if units == 10:\n"
+        "        return 20 if premium else 30\n"
+        "    return units * 2\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "billing.py")
+    _git(repo, "commit", "-m", "refactor: shortcut billing")
+
+    res = evaluate_nocheat_gate(repo, "main", "HEAD")
+    assert res.targets == ("tests/test_billing.py",)
+    assert res.verdict == "BLOCK"
+    assert not any("BASELINE_TESTS_FAILED" in r for r in res.reasons)
+    assert "CONTRACT_COUNTEREXAMPLE: billing:charge" in res.reasons
