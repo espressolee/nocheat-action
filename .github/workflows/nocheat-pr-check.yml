@@ -1,0 +1,46 @@
+name: NoCheat PR Check
+
+on:
+  pull_request:
+
+jobs:
+  standard-ci-pytest:
+    name: Standard CI (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install "pytest>=8.0"
+      - run: python3 -m pytest -v tests/test_example_billing.py
+
+  nocheat-observe:
+    name: NoCheat Merge Gate (observe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install "pytest>=8.0"
+      - uses: ./
+        with:
+          mode: observe
+
+  nocheat-enforce:
+    name: NoCheat Merge Gate (enforce)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install "pytest>=8.0"
+      - uses: ./
+        with:
+          mode: enforce
