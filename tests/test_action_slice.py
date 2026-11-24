@@ -382,3 +382,58 @@ def test_impact_fallback_does_not_pull_unrelated_slow_tests(tmp_path: Path):
     assert res.verdict == "BLOCK"
     assert not any("BASELINE_TESTS_FAILED" in r for r in res.reasons)
     assert "CONTRACT_COUNTEREXAMPLE: billing:charge" in res.reasons
+
+
+def test_skip_decorator_distinguishes_runtime_guards_from_unconditional_skips():
+    """Runtime platform guards (unittest.skipUnless/skipIf) must not trigger POD002,
+    while unconditional constant skips (skip, skipIf(True), skipUnless(False)) must."""
+    from nocheat_gate.tier0_syntax import _is_skip_decorator
+
+    def _dec(expr: str) -> ast.AST:
+        mod = ast.parse(f"@{expr}\ndef f():\n    pass\n")
+        return mod.body[0].decorator_list[0]  # type: ignore[attr-defined]
+
+    # Legitimate runtime/platform guards -> False
+    assert _is_skip_decorator(_dec('unittest.skipUnless(os.name == "posix", "POSIX only")')) is False
+    assert _is_skip_decorator(_dec('unittest.skipIf(sys.platform == "win32", "non-Windows")')) is False
+    assert _is_skip_decorator(_dec('pytest.mark.skipif(sys.platform == "win32", reason="non-Windows")')) is False
+    assert _is_skip_decorator(_dec('pytest.mark.skipif("sys.version_info < (3, 11)", reason="py311+")')) is False
+    assert _is_skip_decorator(_dec('unittest.skipUnless(True, "always runs")')) is False
+    assert _is_skip_decorator(_dec('unittest.skipIf(False, "never skips")')) is False
+
+    # Unconditional skip/xfail bypasses -> True
+    assert _is_skip_decorator(_dec('unittest.skip("broken")')) is True
+    assert _is_skip_decorator(_dec('unittest.skipIf(True, "disabled")')) is True
+    assert _is_skip_decorator(_dec('unittest.skipUnless(False, "disabled")')) is True
+    assert _is_skip_decorator(_dec('unittest.expectedFailure')) is True
+    assert _is_skip_decorator(_dec('pytest.mark.skip(reason="broken")')) is True
+    assert _is_skip_decorator(_dec('pytest.mark.skipif(True, reason="disabled")')) is True
+    assert _is_skip_decorator(_dec('pytest.mark.skipif("True", reason="disabled")')) is True
+    assert _is_skip_decorator(_dec('pytest.mark.xfail(reason="flaky")')) is True
+
+
+def test_pr_adding_platform_guarded_unittest_passes(tmp_path: Path):
+    """Adding a POSIX-guarded unittest.skipUnless test must not false-block as POD002."""
+    repo = tmp_path / "platform_guard_repo"
+    _init_base_repo(repo, with_contract=False)
+    _git(repo, "checkout", "-b", "add-posix-test")
+    (repo / "tests" / "test_billing.py").write_text(
+        "import os\n"
+        "import unittest\n"
+        "from billing import charge\n\n"
+        "class BillingTests(unittest.TestCase):\n"
+        "    def test_standard_charge(self):\n"
+        "        self.assertEqual(charge(10, False), 30)\n\n"
+        "    def test_premium_charge(self):\n"
+        "        self.assertEqual(charge(10, True), 20)\n\n"
+        "    @unittest.skipUnless(os.name == 'posix', 'POSIX only')\n"
+        "    def test_zero_units(self):\n"
+        "        self.assertEqual(charge(0, False), 0)\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tests/test_billing.py")
+    _git(repo, "commit", "-m", "test: add POSIX-guarded test")
+
+    res = evaluate_nocheat_gate(repo, "main", "HEAD")
+    assert not any(f.rule_id == "POD002" for f in res.tier0_findings)
+    assert res.verdict == "PASS"

@@ -10,7 +10,6 @@ import subprocess
 
 from .diff_scope import FileDiffSummary, git_show_file
 
-_SKIP_DECORATOR_NAMES = frozenset({"skip", "skipif", "xfail"})
 _WEAK_ATTRS = frozenset(
     {
         "assertTrue",
@@ -49,21 +48,61 @@ class _ParsedTestFn:
     vacuous_asserts: int
 
 
-def _is_skip_decorator(dec: ast.AST) -> bool:
-    txt = ast.unparse(dec)
-    if "pytest.mark.skipif" in txt:
-        # Treat `pytest.mark.skipif(True, ...)` as unconditional skip, ignore runtime env skipif
-        if isinstance(dec, ast.Call) and dec.args and isinstance(dec.args[0], ast.Constant):
-            return bool(dec.args[0].value is True)
+_UNCONDITIONAL_SKIP_TARGETS = frozenset(
+    {
+        "pytest.mark.skip",
+        "pytest.mark.xfail",
+        "unittest.skip",
+        "unittest.expectedFailure",
+        "skip",
+        "xfail",
+        "expectedFailure",
+    }
+)
+_SKIPIF_TARGETS = frozenset({"pytest.mark.skipif", "unittest.skipIf", "skipif", "skipIf"})
+_SKIPUNLESS_TARGETS = frozenset({"unittest.skipUnless", "skipUnless"})
+
+
+def _extract_condition_arg(dec: ast.AST) -> ast.AST | None:
+    if not isinstance(dec, ast.Call):
+        return None
+    if dec.args:
+        return dec.args[0]
+    for kw in dec.keywords:
+        if kw.arg == "condition":
+            return kw.value
+    return None
+
+
+def _constant_bool_condition(node: ast.AST | None) -> bool | None:
+    if not isinstance(node, ast.Constant):
+        return None
+    val = node.value
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int):
+        return bool(val)
+    if val is None:
         return False
-    return any(
-        k in txt
-        for k in (
-            "pytest.mark.skip",
-            "pytest.mark.xfail",
-            "unittest.skip",
-        )
-    ) or (isinstance(dec, ast.Name) and dec.id in _SKIP_DECORATOR_NAMES)
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped == "True":
+            return True
+        if stripped == "False":
+            return False
+    return None
+
+
+def _is_skip_decorator(dec: ast.AST) -> bool:
+    func = dec.func if isinstance(dec, ast.Call) else dec
+    target = ast.unparse(func)
+    if target in _SKIPIF_TARGETS or target.endswith((".mark.skipif", ".skipIf")):
+        return _constant_bool_condition(_extract_condition_arg(dec)) is True
+    if target in _SKIPUNLESS_TARGETS or target.endswith(".skipUnless"):
+        return _constant_bool_condition(_extract_condition_arg(dec)) is False
+    return target in _UNCONDITIONAL_SKIP_TARGETS or target.endswith(
+        (".mark.skip", ".mark.xfail", ".unittest.skip", ".unittest.expectedFailure")
+    )
 
 
 def _is_vacuous_assert_stmt(stmt: ast.Assert) -> bool:
