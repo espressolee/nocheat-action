@@ -1,0 +1,102 @@
+name: 'NoCheat Merge Gate'
+description: 'Zero-LLM deterministic PR verification oracle: diff-scoped mutation, test soundness, concurrency, and base-pinned contracts'
+author: 'NoCheat'
+
+inputs:
+  mode:
+    description: 'Operation mode: "observe" (shadow report only, exit 0) or "enforce" (exit 2 on confirmed BLOCK witness)'
+    required: false
+    default: 'observe'
+  repo:
+    description: 'Repository path to evaluate (defaults to GITHUB_WORKSPACE)'
+    required: false
+    default: ''
+  base-ref:
+    description: 'Base git commit SHA or ref to diff against (auto-detected on pull_request events)'
+    required: false
+    default: ''
+  head-ref:
+    description: 'Head git commit SHA or ref to evaluate (auto-detected on pull_request events)'
+    required: false
+    default: ''
+  python-bin:
+    description: 'Python executable to use (must have repository test runner available, e.g. pytest)'
+    required: false
+    default: 'python3'
+  json:
+    description: 'Emit raw JSON verdict payload to stdout ("true" or "false")'
+    required: false
+    default: 'false'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run NoCheat Merge Gate
+      shell: bash
+      env:
+        NOCHEAT_RUNTIME_ROOT: ${{ github.action_path }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_REPO: ${{ inputs.repo }}
+        INPUT_BASE: ${{ inputs.base-ref }}
+        INPUT_HEAD: ${{ inputs.head-ref }}
+        INPUT_PYTHON: ${{ inputs.python-bin }}
+        INPUT_JSON: ${{ inputs.json }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_BASE_REF: ${{ github.base_ref }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+
+        TARGET_REPO="${INPUT_REPO:-${GITHUB_WORKSPACE:-.}}"
+        PYTHON_BIN="${INPUT_PYTHON:-python3}"
+        TARGET_MODE="${INPUT_MODE:-observe}"
+
+        if [ -n "$INPUT_BASE" ]; then
+          TARGET_BASE="$INPUT_BASE"
+        elif [ -n "$PR_BASE_SHA" ]; then
+          TARGET_BASE="$PR_BASE_SHA"
+        elif [ -n "$PR_BASE_REF" ] && git -C "$TARGET_REPO" rev-parse --verify "origin/$PR_BASE_REF^{commit}" >/dev/null 2>&1; then
+          TARGET_BASE="origin/$PR_BASE_REF"
+        else
+          TARGET_BASE="HEAD~1"
+        fi
+
+        if [ -n "$INPUT_HEAD" ]; then
+          TARGET_HEAD="$INPUT_HEAD"
+        elif [ -n "$PR_HEAD_SHA" ]; then
+          TARGET_HEAD="$PR_HEAD_SHA"
+        else
+          TARGET_HEAD="HEAD"
+        fi
+
+        if ! git -C "$TARGET_REPO" rev-parse --verify "${TARGET_BASE}^{commit}" >/dev/null 2>&1; then
+          echo "::error::Base commit '${TARGET_BASE}' is not reachable in '${TARGET_REPO}'. Ensure actions/checkout uses fetch-depth: 0."
+          exit 1
+        fi
+        if ! git -C "$TARGET_REPO" rev-parse --verify "${TARGET_HEAD}^{commit}" >/dev/null 2>&1; then
+          echo "::error::Head commit '${TARGET_HEAD}' is not reachable in '${TARGET_REPO}'."
+          exit 1
+        fi
+
+        EXTRA_ARGS=()
+        if [ "$INPUT_JSON" = "true" ]; then
+          EXTRA_ARGS+=(--json)
+        fi
+
+        echo "::group::NoCheat Merge Gate ($TARGET_MODE mode: $TARGET_BASE..$TARGET_HEAD)"
+        set +e
+        PYTHONPATH="${{ github.action_path }}${PYTHONPATH:+:$PYTHONPATH}" \
+          "$PYTHON_BIN" -B -m nocheat_gate.cli \
+          --repo "$TARGET_REPO" \
+          --base "$TARGET_BASE" \
+          --head "$TARGET_HEAD" \
+          --mode "$TARGET_MODE" \
+          "${EXTRA_ARGS[@]}"
+        RC=$?
+        set -e
+        echo "::endgroup::"
+        exit $RC

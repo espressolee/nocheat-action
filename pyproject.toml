@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nocheat-merge-gate"
+version = "0.1.0"
+description = "Zero-LLM deterministic verification gate for AI-assisted and human pull requests"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+nocheat-gate = "nocheat_gate.cli:main"
+nocheat-replay = "nocheat_gate.contracts:main"
+
+[tool.setuptools.packages.find]
+include = ["nocheat_gate", "nocheat_gate.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

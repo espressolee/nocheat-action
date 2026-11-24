@@ -1,0 +1,97 @@
+name: Verify NoCheat Action
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-and-boundary-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package and pytest
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --no-deps .
+          python3 -m pip install "pytest>=8.0"
+
+      - name: Run unit and boundary test suite
+        run: python3 -m pytest -v tests/
+
+  live-action-e2e:
+    runs-on: ubuntu-latest
+    needs: unit-and-boundary-tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest for demo fixture runner
+        run: python3 -m pip install "pytest>=8.0"
+
+      - name: Build 4 realistic PR scenario repositories
+        id: setup-demos
+        run: |
+          python3 -B tests/build_e2e_demo_repos.py "$RUNNER_TEMP/nocheat-e2e"
+          echo "root=$RUNNER_TEMP/nocheat-e2e" >> "$GITHUB_OUTPUT"
+
+      - name: Scenario 1 — Pure docs PR (expect PASS / NO_EXECUTABLE_SOURCE_CHANGES)
+        uses: ./
+        with:
+          repo: ${{ steps.setup-demos.outputs.root }}/pr1_docs_only
+          base-ref: main
+          head-ref: HEAD
+          mode: enforce
+
+      - name: Scenario 2 — Clean test refactor PR (expect PASS / NO_MUTABLE_LOGIC_DIFF)
+        uses: ./
+        with:
+          repo: ${{ steps.setup-demos.outputs.root }}/pr2_clean_test_refactor
+          base-ref: main
+          head-ref: HEAD
+          mode: enforce
+
+      - name: Scenario 3a — AI shortcut PR in observe mode (expect exit 0 + WITNESS FOUND)
+        uses: ./
+        with:
+          repo: ${{ steps.setup-demos.outputs.root }}/pr3_ai_shortcut
+          base-ref: main
+          head-ref: HEAD
+          mode: observe
+
+      - name: Scenario 3b — AI shortcut PR in enforce mode (expect exit 2)
+        run: |
+          set +e
+          PYTHONPATH="$GITHUB_WORKSPACE" python3 -B -m nocheat_gate.cli \
+            --repo "${{ steps.setup-demos.outputs.root }}/pr3_ai_shortcut" \
+            --base main \
+            --head HEAD \
+            --mode enforce
+          RC=$?
+          set -e
+          echo "enforce_rc=$RC"
+          test "$RC" -eq 2
+
+      - name: Scenario 4 — Self-modified contract PR (expect ABSTAIN / exit 0)
+        uses: ./
+        with:
+          repo: ${{ steps.setup-demos.outputs.root }}/pr4_contract_tamper
+          base-ref: main
+          head-ref: HEAD
+          mode: enforce
