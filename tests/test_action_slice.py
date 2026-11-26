@@ -1542,6 +1542,8 @@ def test_monorepo_include_and_exclude_path_filters(tmp_path: Path):
     repo = tmp_path / "monorepo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "NoCheat Test")
+    _git(repo, "config", "user.email", "test@example.com")
     (repo / "pkg_a").mkdir()
     (repo / "pkg_b").mkdir()
     (repo / "tests").mkdir()
@@ -1606,6 +1608,8 @@ def test_language_oracle_protocol_and_registry_dispatch(tmp_path: Path):
     repo = tmp_path / "oracle-repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "NoCheat Test")
+    _git(repo, "config", "user.email", "test@example.com")
     (repo / "billing.py").write_text("def charge(x):\n    return x * 2\n", encoding="utf-8")
     (repo / "tests").mkdir()
     (repo / "tests" / "test_billing.py").write_text(
