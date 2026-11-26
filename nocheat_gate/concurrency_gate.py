@@ -48,6 +48,7 @@ class ConcurrencyGateReport:
     concurrent_observed: bool
     reasons: tuple[str, ...]
     elapsed_s: float
+    skip_reason: str | None = None
 
 
 def _attr_root_name(node: ast.AST) -> str | None:
@@ -699,9 +700,11 @@ def run_concurrency_pct_gate(
         repo_dir, head_ref, scopes, prod_files, test_files=test_files
     )
     if not analysis.triggered or runner_mode not in {"script", "pytest"} or not targets:
+        skip_reason = 'CONCURRENCY_RUNNER_UNSUPPORTED' if analysis.triggered else 'NO_CONCURRENCY_TRIGGER'
+        needs_review = analysis.triggered and runner_mode == 'custom'
         return ConcurrencyGateReport(
-            triggered=False,
-            verdict="PASS",
+            triggered=analysis.triggered,
+            verdict='ABSTAIN' if needs_review else 'PASS',
             mode="none",
             fifo_passed=True,
             pct_caught=False,
@@ -710,8 +713,9 @@ def run_concurrency_pct_gate(
             pct_bug_depth=None,
             schedules_run=0,
             concurrent_observed=False,
-            reasons=(),
+            reasons=(skip_reason,) if needs_review else (),
             elapsed_s=time.monotonic() - t0,
+            skip_reason=skip_reason,
         )
 
     mode = "mixed" if (analysis.has_async and analysis.has_threading) else (

@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
+from dataclasses import replace
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+import shlex
+from types import SimpleNamespace
 
 import pytest
 
 from build_e2e_demo_repos import _git, _init_base_repo, build_all
-from nocheat_gate.cli import main, render_markdown_summary
-from nocheat_gate.gate import GateResult, evaluate_nocheat_gate
+from nocheat_gate import runner
+from nocheat_gate import cli as gate_cli
+from nocheat_gate import gate as gate_engine
+from nocheat_gate.cli import _abstain_action, main, render_markdown_summary
+from nocheat_gate.diff_scope import extract_diff_scope
+from nocheat_gate.gate import GateResult, SurvivingMutant, _evaluate_calibrated_gate_mutation, evaluate_nocheat_gate
+from nocheat_gate.mutator import MutantCandidate
 
 PKG_ROOT = Path(__file__).resolve().parent.parent / "nocheat_gate"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -286,11 +295,12 @@ def test_cli_json_and_enforce_exit_codes(tmp_path: Path, capsys: pytest.CaptureF
 
 
 def test_action_yml_shell_execution_on_live_demo_repos(tmp_path: Path):
-    """Execute the composite action.yml bash block directly against pr1 and pr3."""
+    """Execute the composite action's bash block with local GitHub input values."""
     repos = build_all(tmp_path)
     summary = tmp_path / "gh_step_summary.md"
 
-    def run_action(repo: Path, mode: str) -> subprocess.CompletedProcess[str]:
+    def run_action(repo: Path, mode: str, test_cmd: str = '',
+                   runtime_root: Path = REPO_ROOT) -> subprocess.CompletedProcess[str]:
         base_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "main"], text=True).strip()
         head_sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
         env = os.environ.copy()
@@ -299,36 +309,23 @@ def test_action_yml_shell_execution_on_live_demo_repos(tmp_path: Path):
                 "GITHUB_ACTION_PATH": str(REPO_ROOT),
                 "GITHUB_WORKSPACE": str(repo),
                 "GITHUB_STEP_SUMMARY": str(summary),
-                "NOCHEAT_RUNTIME_ROOT": str(REPO_ROOT),
+                "NOCHEAT_RUNTIME_ROOT": str(runtime_root),
                 "INPUT_MODE": mode,
                 "INPUT_REPO": "",
                 "INPUT_BASE": "",
                 "INPUT_HEAD": "",
                 "INPUT_PYTHON": sys.executable,
                 "INPUT_JSON": "false",
+                'INPUT_TEST_CMD': test_cmd,
                 "PR_BASE_SHA": base_sha,
                 "PR_BASE_REF": "main",
                 "PR_HEAD_SHA": head_sha,
             }
         )
-        script = (
-            "set -euo pipefail\n"
-            'TARGET_REPO="${INPUT_REPO:-${GITHUB_WORKSPACE:-.}}"\n'
-            'PYTHON_BIN="${INPUT_PYTHON:-python3}"\n'
-            'TARGET_MODE="${INPUT_MODE:-observe}"\n'
-            'if [ -n "$INPUT_BASE" ]; then TARGET_BASE="$INPUT_BASE"; '
-            'elif [ -n "$PR_BASE_SHA" ]; then TARGET_BASE="$PR_BASE_SHA"; '
-            'else TARGET_BASE="HEAD~1"; fi\n'
-            'if [ -n "$INPUT_HEAD" ]; then TARGET_HEAD="$INPUT_HEAD"; '
-            'elif [ -n "$PR_HEAD_SHA" ]; then TARGET_HEAD="$PR_HEAD_SHA"; '
-            'else TARGET_HEAD="HEAD"; fi\n'
-            'git -C "$TARGET_REPO" rev-parse --verify "${TARGET_BASE}^{commit}" >/dev/null\n'
-            'git -C "$TARGET_REPO" rev-parse --verify "${TARGET_HEAD}^{commit}" >/dev/null\n'
-            'PYTHONPATH="$GITHUB_ACTION_PATH${PYTHONPATH:+:$PYTHONPATH}" '
-            '"$PYTHON_BIN" -B -m nocheat_gate.cli '
-            '--repo "$TARGET_REPO" --base "$TARGET_BASE" --head "$TARGET_HEAD" --mode "$TARGET_MODE"\n'
-        )
-        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        raw_script = (REPO_ROOT / 'action.yml').read_text(encoding='utf-8').split('      run: |\n', 1)[1]
+        script = '\n'.join(line.removeprefix('        ') for line in raw_script.splitlines())
+        script = script.replace('${{ github.action_path }}', '$GITHUB_ACTION_PATH')
+        return subprocess.run(["bash", "-c", script], cwd=repo, env=env, capture_output=True, text=True)
 
     p1 = run_action(repos["pr1_docs_only"], "enforce")
     assert p1.returncode == 0, p1.stderr
@@ -340,8 +337,1049 @@ def test_action_yml_shell_execution_on_live_demo_repos(tmp_path: Path):
 
     p3_enf = run_action(repos["pr3_ai_shortcut"], "enforce")
     assert p3_enf.returncode == 2
+    assert 'Surviving diff mutants:' in p3_enf.stdout
+    assert 'billing.py:' in p3_enf.stdout and ' → + ' in p3_enf.stdout
+
+    p4 = run_action(repos['pr4_contract_tamper'], 'enforce')
+    assert p4.returncode == 0
+    assert 'land the approved contract on the base branch first' in p4.stdout
     assert summary.exists()
-    assert "NoCheat Merge Gate" in summary.read_text(encoding="utf-8")
+    markdown = summary.read_text(encoding='utf-8')
+    assert 'NoCheat Merge Gate' in markdown
+    assert 'Surviving Diff Mutants' in markdown and 'billing.py:' in markdown
+    assert 'land the approved contract on the base branch first' in markdown
+
+    overridden = run_action(
+        repos['pr3_ai_shortcut'], 'enforce',
+        shlex.join([sys.executable, '-B', '-m', 'pytest', 'tests/test_billing.py']),
+    )
+    assert overridden.returncode == 2, overridden.stderr
+    assert 'explicit command' in summary.read_text(encoding='utf-8')
+
+    shadow = repos['pr1_docs_only'] / 'nocheat_gate'
+    shadow.mkdir()
+    (shadow / '__init__.py').write_text('', encoding='utf-8')
+    (shadow / 'cli.py').write_text('raise SystemExit(47)\n', encoding='utf-8')
+    genuine = run_action(repos['pr1_docs_only'], 'enforce')
+    assert genuine.returncode == 0 and 'verdict=PASS' in genuine.stdout
+    empty = tmp_path / 'empty-action'
+    empty.mkdir()
+    unavailable = run_action(repos['pr1_docs_only'], 'enforce', runtime_root=empty)
+    assert unavailable.returncode == 1
+    assert 'package is unavailable at its trusted path' in unavailable.stderr
+
+
+def test_summary_bounds_and_escapes_survivors_without_fabricating_lines(tmp_path: Path):
+    repo = build_all(tmp_path)['pr1_docs_only']
+    base = evaluate_nocheat_gate(repo, 'main', 'HEAD')
+    hostile = '`<tag>\n::error::\x1b[31m' + 'z' * 1000
+    result = replace(
+        base, verdict='ABSTAIN', reasons=('NO_TEST_TARGETS_SELECTED: ' + hostile,),
+        surviving_mutant_details=(
+            SurvivingMutant('app.py', None, hostile, None),
+            SurvivingMutant('app.py', 7, '', ('return 1', 'return None')),
+        ) * 7,
+    )
+    summary = render_markdown_summary(result, 'observe')
+    assert 'location unavailable' in summary and 'app.py:0' not in summary
+    assert 'app.py:7' in summary and '- return 1 → + return None' in summary
+    assert '\n::error::' not in summary and '\x1b' not in summary
+    assert chr(96) * 2 + ' ' + hostile[:6] in summary
+    assert '2 more surviving mutants.' in summary and 'z' * 300 not in summary
+
+
+@pytest.mark.parametrize('config_name, pattern_config', [
+    ('pytest.ini', '[pytest]\npython_files = selftest_*.py\n'),
+    ('pyproject.toml', '[tool.pytest.ini_options]\npython_files = ["selftest_*.py"]\n'),
+    ('pyproject.toml', '[tool.pytest.ini_options]\npython_files = "selftest_*.py"\n'),
+])
+def test_configured_pytest_suite_is_discovered_on_production_change(
+    tmp_path: Path, config_name: str, pattern_config: str,
+):
+    repo = tmp_path / 'configured'
+    _init_base_repo(repo)
+    (repo / 'selftest_billing.py').write_text(
+        'from billing import charge\n'
+        'def test_charge():\n'
+        '    assert charge(5, True) == 10\n'
+        '    assert charge(5, False) == 15\n',
+        encoding='utf-8',
+    )
+    (repo / 'tests/test_billing.py').write_text('def test_excluded():\n    assert False\n', encoding='utf-8')
+    (repo / config_name).write_text(pattern_config, encoding='utf-8')
+    _git(repo, 'add', config_name, 'selftest_billing.py', 'tests/test_billing.py')
+    _git(repo, 'commit', '-m', 'base: configure selftest collection')
+    _git(repo, 'checkout', '-b', 'edit')
+    billing = repo / 'billing.py'
+    billing.write_text(billing.read_text().replace('rate', 'multiplier'), encoding='utf-8')
+    _git(repo, 'add', 'billing.py')
+    _git(repo, 'commit', '-m', 'refactor billing local variable')
+    (repo / config_name).write_text(pattern_config.replace('selftest_', 'uncommitted_'), encoding='utf-8')
+
+    res = evaluate_nocheat_gate(repo, 'main', 'HEAD')
+    assert res.runner_mode == 'pytest'
+    assert res.targets == ('selftest_billing.py',)
+    assert res.killed_mutants > 0 and res.verdict != 'BASELINE_FAIL'
+
+
+def test_pytest_ini_precedence_and_base_pinned_classification(tmp_path: Path):
+    repo = tmp_path / 'precedence'
+    _init_base_repo(repo)
+    (repo / 'pytest.ini').write_text('[pytest]\npython_files = selftest_*.py\n', encoding='utf-8')
+    (repo / 'pyproject.toml').write_text(
+        '[tool.pytest.ini_options]\npython_files = ["*.py"]\n', encoding='utf-8',
+    )
+    _git(repo, 'add', 'pytest.ini', 'pyproject.toml')
+    _git(repo, 'commit', '-m', 'base: pin discovery naming')
+    _git(repo, 'checkout', '-b', 'edit')
+    (repo / 'pytest.ini').write_text('[pytest]\npython_files = *.py\n', encoding='utf-8')
+    (repo / 'billing.py').write_text('def charge(units, premium):\n    return units * 2\n', encoding='utf-8')
+    (repo / 'tests/selftest_billing.py').write_text('def test_basic():\n    assert True\n', encoding='utf-8')
+    _git(repo, 'add', 'pytest.ini', 'billing.py', 'tests/selftest_billing.py')
+    _git(repo, 'commit', '-m', 'edit source and collection configuration')
+    scope = extract_diff_scope(repo, 'main', 'HEAD')
+    assert scope.pytest_python_files == ('selftest_*.py',)
+    assert [entry.rel_path for entry in scope.prod_files] == ['billing.py']
+    assert [entry.rel_path for entry in scope.test_files] == ['tests/selftest_billing.py']
+
+
+def test_custom_command_runs_same_argv_for_baseline_and_mutants(tmp_path: Path, capsys):
+    repo = tmp_path / 'script_runner'
+    _init_base_repo(repo)
+    script = repo / 'check suite.py'
+    script.write_text(
+        'import sys\nfrom billing import charge\n'
+        'assert sys.argv[1:] == ["one ; two"]\n'
+        'assert charge(5, False) == 15\nassert charge(5, True) == 10\n', encoding='utf-8',
+    )
+    _git(repo, 'add', script.name)
+    _git(repo, 'commit', '-m', 'base: runnable self check')
+    _git(repo, 'checkout', '-b', 'edit')
+    billing = repo / 'billing.py'
+    billing.write_text(
+        billing.read_text().replace('rate', 'factor').replace('units < 0', '0 > units'),
+        encoding='utf-8',
+    )
+    _git(repo, 'add', 'billing.py')
+    _git(repo, 'commit', '-m', 'refactor billing local variable')
+    args = ['--repo', str(repo), '--mode', 'enforce', '--json']
+    command = shlex.join([sys.executable, '-B', script.name, 'one ; two'])
+    assert main([*args, '--test-cmd', command]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['runner_mode'] == 'custom'
+    assert payload['killed_mutants'] > 0 and payload['survived_mutants'] > 0
+
+    assert main([*args, '--test-cmd', '/nocheat-test-command-does-not-exist']) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['verdict'] == 'BASELINE_FAIL' and payload['run_mutants'] == 0
+
+    with pytest.raises(SystemExit) as exc:
+        main([*args, '--test-cmd', '"unterminated'])
+    assert exc.value.code == 2 and '--test-cmd' in capsys.readouterr().err
+
+
+def test_init_contract_generates_base_pinned_contract_consumed_by_gate(tmp_path: Path, capsys):
+    repo = tmp_path / 'scaffold'
+    _init_base_repo(repo)
+    command = [
+        'init-contract', '--repo', str(repo), '--target', 'billing:charge',
+        '--inputs', '{"units": {"type":"int","min":1,"max":30}, "premium": {"type":"bool"}}',
+        '--requires', 'units > 0', '--ensures', 'result == units * (2 if premium else 3)',
+    ]
+    assert main(command) == 0
+    path = repo / '.nocheat-contracts.json'
+    original = path.read_bytes()
+    assert 'land it on the base branch' in capsys.readouterr().out
+    assert main([*command, '--ensures', 'False']) == 1
+    assert 'already exists' in capsys.readouterr().err and path.read_bytes() == original
+    _git(repo, 'add', path.name)
+    _git(repo, 'commit', '-m', 'base: land generated contract')
+    _git(repo, 'checkout', '-b', 'edit')
+    (repo / 'billing.py').write_text(
+        'def charge(units, premium):\n'
+        '    if units == 10:\n        return 20 if premium else 30\n'
+        '    return units * 2\n', encoding='utf-8',
+    )
+    _git(repo, 'add', 'billing.py')
+    _git(repo, 'commit', '-m', 'candidate: change behavior outside the test inputs')
+    assert main(['--repo', str(repo), '--mode', 'enforce', '--json']) == 2
+    verdict = json.loads(capsys.readouterr().out)
+    assert verdict['contract_report']['status'] == 'COUNTEREXAMPLE'
+    assert verdict['contract_report']['counterexamples'][0]['target'] == 'billing:charge'
+
+
+def test_init_contract_rejects_bad_schema_and_preserves_dangling_symlink(tmp_path: Path, capsys):
+    path = tmp_path / '.nocheat-contracts.json'
+    command = ['init-contract', '--repo', str(tmp_path), '--target', 'billing:charge', '--ensures', 'result > 0']
+    with pytest.raises(SystemExit) as exc:
+        main([*command, '--inputs', '{}'])
+    assert exc.value.code == 2 and not path.exists()
+    assert 'invalid contract' in capsys.readouterr().err
+    path.symlink_to('missing.json')
+    assert main([*command, '--inputs', '{"units": {"type":"int","min":1,"max":2}}']) == 1
+    assert path.is_symlink() and os.readlink(path) == 'missing.json'
+    assert not (tmp_path / 'missing.json').exists()
+
+
+def _review_source_edit(repo: Path, *, script: str | None = None, threaded: bool = False) -> str:
+    _init_base_repo(repo)
+    if script is not None:
+        (repo / 'smoke.py').write_text(script, encoding='utf-8')
+        _git(repo, 'add', 'smoke.py')
+        _git(repo, 'commit', '-m', 'base: test command')
+    _git(repo, 'checkout', '-b', 'edit')
+    billing = repo / 'billing.py'
+    code = billing.read_text().replace('rate', 'factor').replace('units < 0', '0 > units')
+    if threaded:
+        code = 'import threading\n' + code.replace('    if 0', '    threading.current_thread()\n    if 0')
+    billing.write_text(code, encoding='utf-8')
+    _git(repo, 'add', 'billing.py')
+    _git(repo, 'commit', '-m', 'candidate: equivalent refactor')
+    return code
+
+
+@pytest.mark.parametrize('inventory_limit', [False, True])
+def test_review_wildcard_discovery_keeps_production_in_direct_mutation_scope(tmp_path, inventory_limit):
+    repo = tmp_path / 'wildcard'
+    _init_base_repo(repo)
+    src = repo / 'src'
+    src.mkdir()
+    (repo / 'billing.py').rename(src / 'billing.py')
+    (repo / 'tests/test_billing.py').rename(repo / 'tests/invoice.py')
+    (repo / 'pytest.ini').write_text('[pytest]\ntestpaths = tests\npython_files = *.py\n', encoding='utf-8')
+    for index in range(513 if inventory_limit else 0):
+        (repo / f'module_{index:03d}.py').write_text('pass\n', encoding='utf-8')
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-m', 'base: wildcard discovery in tests directory')
+    _git(repo, 'checkout', '-b', 'edit')
+    billing = src / 'billing.py'
+    billing.write_text(billing.read_text().replace('rate', 'factor'), encoding='utf-8')
+    _git(repo, 'add', 'src/billing.py')
+    _git(repo, 'commit', '-m', 'candidate: change production function')
+    scope = extract_diff_scope(repo, 'main', 'HEAD')
+    res = evaluate_nocheat_gate(repo, 'main', 'HEAD')
+    if inventory_limit:
+        assert res.verdict == 'ABSTAIN' and 'PYTEST_DISCOVERY_LIMIT' in res.reasons
+        assert res.total_mutants > 0 and res.run_mutants == 0
+    else:
+        assert [item.rel_path for item in scope.prod_scopes] == ['src/billing.py']
+        assert res.targets == ('tests/invoice.py',)
+        assert res.run_mutants > 0
+
+
+@pytest.mark.parametrize('threaded, verdict', [(False, 'PASS'), (True, 'ABSTAIN')])
+def test_review_custom_probe_status_and_snapshot_isolation(tmp_path, capsys, threaded, verdict):
+    repo = tmp_path / 'custom'
+    _review_source_edit(repo, threaded=threaded, script=(
+        'from pathlib import Path\nfrom billing import charge\n'
+        'marker = Path(".test-state")\nassert not marker.exists()\nmarker.touch()\n'
+        'assert charge(5, True) == 10\nassert charge(5, False) == 15\n'
+    ))
+    summary = tmp_path / 'summary.md'
+    args = ['--repo', str(repo), '--mode', 'enforce', '--test-cmd', shlex.join([sys.executable, '-B', 'smoke.py'])]
+    assert main([*args, '--summary-file', str(summary), '--json']) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data['verdict'] == verdict
+    assert type(data['idempotent']) is bool
+    assert data['concurrency_verdict'] == verdict
+    assert data['idempotence_execution']['status'] == data['concurrency_execution']['status'] == 'SKIPPED'
+    assert data['idempotence_execution']['reason'] == 'CUSTOM_TEST_COMMAND'
+    expected = 'CONCURRENCY_RUNNER_UNSUPPORTED' if threaded else 'NO_CONCURRENCY_TRIGGER'
+    assert data['concurrency_execution']['reason'] == expected
+    assert data['survived_mutants'] > 0 and data['killed_mutants'] > 0
+    assert main(args) == 0
+    stdout = capsys.readouterr().out
+    assert 'SKIPPED (CUSTOM_TEST_COMMAND)' in stdout and f'SKIPPED ({expected})' in stdout
+    markdown = summary.read_text(encoding='utf-8')
+    assert 'SKIPPED (CUSTOM_TEST_COMMAND)' in markdown and f'SKIPPED ({expected})' in markdown
+
+
+@pytest.mark.parametrize('runner_rc, gate_rc, verdict', [(0, 2, 'BLOCK'), (1, 1, 'BASELINE_FAIL')])
+def test_review_non_utf8_process_output_preserves_json_and_exit(tmp_path, capsys, runner_rc, gate_rc, verdict):
+    repo = tmp_path / 'binary-output'
+    _review_source_edit(repo, script=f'import sys\nsys.stdout.buffer.write(bytes([255]))\nsys.exit({runner_rc})\n')
+    command = shlex.join([sys.executable, '-B', 'smoke.py'])
+    assert main(['--repo', str(repo), '--test-cmd', command, '--json', '--mode', 'enforce']) == gate_rc
+    data = json.loads(capsys.readouterr().out)
+    assert data['verdict'] == verdict
+
+
+def test_review_mutant_launch_failure_is_not_scored_as_kill(tmp_path, capsys, monkeypatch):
+    repo = tmp_path / 'missing-runner'
+    code = _review_source_edit(repo, script='import billing\nassert billing.charge(5, True) == 10\n')
+    argv = [sys.executable, '-B', 'smoke.py']
+    real_run = subprocess.run
+    errors = 0
+
+    def run(command, **kwargs):
+        nonlocal errors
+        if command == argv and (Path(kwargs['cwd']) / 'billing.py').read_text(encoding='utf-8') != code:
+            errors += 1
+            raise FileNotFoundError('test fixture: executable unavailable during mutation')
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    assert main(['--repo', str(repo), '--test-cmd', shlex.join(argv), '--json', '--mode', 'enforce']) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert errors > 0 and data['verdict'] == 'ABSTAIN'
+    assert data['mutation_execution']['unavailable'] == errors
+    assert data['run_mutants'] == data['killed_mutants'] == 0
+    assert any(reason.startswith('MUTANT_RUNNER_UNAVAILABLE') for reason in data['reasons'])
+
+
+def test_review_abstain_advice_preserves_location_and_contract_prefix():
+    assert 'Test neighboring inputs' in _abstain_action('SINGLE_LITERAL_GUARD(mod.py:7): if units == 1 -> 4')
+    assert 'Verify the target module' in _abstain_action('pkg.mod:charge: CONTRACT_TARGET_SOURCE_UNAVAILABLE')
+
+
+@pytest.mark.parametrize(('imports', 'assertion', 'expected'), [
+    pytest.param('alpha, beta', 'alpha.charge() + beta.tax() == 5',
+                 [('alpha.py', 'charge'), ('beta.py', 'tax')], id='both-resolve'),
+    pytest.param('alpha, math', 'alpha.charge() + math.floor(1.5) == 3',
+                 [('alpha.py', 'charge')], id='only-first-resolves'),
+    pytest.param('math, beta', 'math.floor(1.5) + beta.tax() == 4',
+                 [('beta.py', 'tax')], id='only-last-resolves'),
+    pytest.param('math, operator', 'math.floor(1.5) + operator.neg(1) == 0',
+                 [], id='neither-resolves-in-git'),
+])
+def test_test_only_multi_import_restores_each_local_callee(tmp_path, imports, assertion, expected):
+    _git(tmp_path, 'init', '-b', 'main')
+    _git(tmp_path, 'config', 'user.name', 'Demo Engineer')
+    _git(tmp_path, 'config', 'user.email', 'demo@example.com')
+    (tmp_path / 'alpha.py').write_text('def charge():\n    return 2\n\ndef unrelated():\n    return -1\n')
+    (tmp_path / 'beta.py').write_text('def tax():\n    return 3\n\ndef unrelated():\n    return -2\n')
+    _git(tmp_path, 'add', 'alpha.py', 'beta.py')
+    _git(tmp_path, 'commit', '-m', 'base: two production modules')
+    _git(tmp_path, 'checkout', '-b', 'test-only')
+    tests = tmp_path / 'tests'
+    tests.mkdir()
+    (tests / 'test_billing.py').write_text(f'import {imports}\n\ndef test_charge():\n    assert {assertion}\n')
+    _git(tmp_path, 'add', 'tests/test_billing.py')
+    _git(tmp_path, 'commit', '-m', 'candidate: exercise callees from a single import statement')
+
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [entry.rel_path for entry in scope.test_files] == ['tests/test_billing.py']
+    assert not scope.prod_files and not scope.prod_scopes
+    assert all(callee.is_fallback_callee for callee in scope.callee_fallback_scopes)
+    assert [(callee.rel_path, callee.scope_name) for callee in scope.callee_fallback_scopes] == expected
+
+
+def _budget_case(root):
+    (root / 'billing.py').write_text('def charge():\n    return 2\n')
+    return MutantCandidate('billing.py', 'charge', 2, 'return 3', 'def charge():\n    return 3\n')
+
+
+@pytest.mark.parametrize(('budget', 'expected'), [
+    (3.0, ('SURVIVED', 0, 1, False, 'BLOCK')),
+    (0.8, ('BUDGET_EXHAUSTED', 0, 0, True, 'ABSTAIN')),
+])
+def test_post_fix_actual_budget_deadline(tmp_path, budget, expected):
+    mutant = _budget_case(tmp_path)
+    battery = runner.run_mutant_battery(
+        tmp_path, [mutant], 'custom', [], per_mutant_timeout_s=2.5, total_budget_s=budget,
+        test_cmd=(sys.executable, '-B', '-c', 'import time; time.sleep(1.2)'),
+    )
+    verdict, _ = _evaluate_calibrated_gate_mutation(battery, test_degraded=False)
+    assert (battery.results[0].status, battery.killed_mutants, battery.run_mutants,
+            battery.budget_exhausted, verdict) == expected
+
+
+@pytest.mark.parametrize(('budget', 'snapshot_time', 'run_time', 'timed_out', 'timeout', 'status', 'scored', 'exhausted'), [
+    (3.0, 0.0, 2.5, True, 2.5, 'KILLED_TIMEOUT', 1, False),
+    (2.5, 0.0, 2.5, True, 2.5, 'TIMEOUT_CAUSE_UNKNOWN', 0, True),
+    (3.0, 0.0, 3.1, True, 2.5, 'TIMEOUT_CAUSE_UNKNOWN', 0, True),
+    (3.0, 2.4, 0.6, True, 0.6, 'BUDGET_EXHAUSTED', 0, True),
+    (3.0, 0.0, 3.1, False, 2.5, 'BUDGET_EXHAUSTED', 0, True),
+    (3.0, 3.0, 0.0, False, None, 'UNRUN_BUDGET', 0, True),
+    (0.4, 0.0, 0.0, False, None, 'UNRUN_BUDGET', 0, True),
+    (3.0, 2.4, 0.3, False, 0.6, 'SURVIVED', 1, False),
+])
+def test_post_fix_budget_clock(tmp_path, monkeypatch, budget, snapshot_time, run_time, timed_out,
+                               timeout, status, scored, exhausted):
+    mutant = _budget_case(tmp_path)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(runner, 'time', SimpleNamespace(monotonic=lambda: clock.now))
+    real_snapshot = runner.temporary_snapshot
+    timeouts = []
+
+    @contextmanager
+    def snapshot(path):
+        with real_snapshot(path) as checkout:
+            clock.now += snapshot_time
+            yield checkout
+
+    def execute(*args, timeout_s, **kwargs):
+        timeouts.append(timeout_s)
+        clock.now += run_time
+        return runner.ExecutionOutcome(not timed_out, timed_out, run_time, -1 if timed_out else 0, '')
+
+    monkeypatch.setattr(runner, 'temporary_snapshot', snapshot)
+    monkeypatch.setattr(runner, 'run_test_command', execute)
+    battery = runner.run_mutant_battery(tmp_path, [mutant], 'custom', [],
+                                       total_budget_s=budget, per_mutant_timeout_s=2.5)
+    assert timeouts == ([] if timeout is None else [pytest.approx(timeout)])
+    assert (battery.results[0].status, battery.run_mutants, battery.budget_exhausted) == (status, scored, exhausted)
+
+
+def test_post_fix_budget_completion_routes_to_cli_as_unscored(tmp_path, monkeypatch, capsys):
+    _budget_scope_fixture(tmp_path, {'billing.py': 'def charge():\n    return 2\n'})
+    _budget_scope_edit(tmp_path, 'billing.py', 'def charge():\n    return 3\n')
+    clock = SimpleNamespace(now=0.0)
+    clock_api = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(gate_engine, 'time', clock_api)
+    monkeypatch.setattr(runner, 'time', clock_api)
+
+    def execute(*args, timeout_s, **kwargs):
+        clock.now += timeout_s
+        return runner.ExecutionOutcome(False, True, timeout_s, -1, '')
+
+    def bounded_gate(*args, **kwargs):
+        return evaluate_nocheat_gate(*args, total_budget_s=0.8, per_mutant_timeout_s=2.5, **kwargs)
+
+    monkeypatch.setattr(runner, 'run_test_command', execute)
+    monkeypatch.setattr(gate_cli, 'evaluate_nocheat_gate', bounded_gate)
+    cmd = shlex.join([sys.executable, '-B', '-c', 'pass'])
+    assert main(['--repo', str(tmp_path), '--test-cmd', cmd, '--mode', 'enforce', '--json']) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['verdict'] == 'ABSTAIN' and report['run_mutants'] == 0
+    assert report['mutation_execution']['budget_unscored'] == report['total_mutants'] > 0
+    assert report['mutation_execution']['timeout_kills'] == 0
+    assert 'PR_BUDGET_EXHAUSTED_120S' in report['reasons']
+
+
+def _budget_scope_fixture(root, files):
+    _git(root, 'init', '-b', 'main')
+    _git(root, 'config', 'user.name', 'Demo Engineer')
+    _git(root, 'config', 'user.email', 'demo@example.com')
+    for name, source in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding='utf-8')
+    _git(root, 'add', *files)
+    _git(root, 'commit', '-m', 'base: configure review fixture')
+    _git(root, 'checkout', '-b', 'candidate')
+
+
+def _budget_scope_edit(root, path, source):
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding='utf-8')
+    _git(root, 'add', path)
+    _git(root, 'commit', '-m', 'candidate: edit one file')
+
+
+@pytest.mark.parametrize('skip', [False, True])
+def test_post_fix_configured_qa_scope(tmp_path, skip):
+    qa = 'qa/check_billing.py'
+    source = 'import pytest\nfrom billing import charge\n\ndef test_charge():\n    assert charge() == 2\n'
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        'src/billing.py': 'def charge():\n    return 2\n',
+        qa: source,
+    })
+    mark = '@pytest.mark.skip(reason="test fixture")\n' if skip else ''
+    _budget_scope_edit(tmp_path, qa, source.replace('def test_charge', mark + 'def test_charge') + '\n')
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [item.rel_path for item in scope.test_files] == [qa] and not scope.prod_files
+    assert [(item.rel_path, item.scope_name) for item in scope.callee_fallback_scopes] == [('src/billing.py', 'charge')]
+    report = evaluate_nocheat_gate(tmp_path, 'main', 'HEAD')
+    assert report.targets == (qa,)
+    assert report.verdict == ('BLOCK' if skip else 'PASS')
+    assert ('POD002' in [item.rule_id for item in report.tier0_findings]) is skip
+
+
+def test_post_fix_configured_collection_requires_test_role(tmp_path):
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = *.py\n',
+        'qa/billing.py': 'def charge():\n    return 2\n',
+    })
+    _budget_scope_edit(tmp_path, 'qa/billing.py', 'def charge():\n    return 3\n')
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [item.rel_path for item in scope.prod_files] == ['qa/billing.py'] and not scope.test_files
+
+
+def test_post_fix_invalid_collection_is_explicit(tmp_path):
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = ../qa\npython_files = *.py\n',
+        'billing.py': 'def charge():\n    return 2\n',
+    })
+    _budget_scope_edit(tmp_path, 'billing.py', 'def charge():\n    return 3\n')
+    report = evaluate_nocheat_gate(tmp_path, 'main', 'HEAD')
+    assert report.verdict == 'ABSTAIN' and any(r.startswith('PYTEST_COLLECTION_AMBIGUOUS') for r in report.reasons)
+
+
+@pytest.mark.parametrize(('test_source', 'expected'), [
+    ('import alpha, beta\ndef test_value():\n    assert alpha.charge() + beta.tax() == 4\n',
+     [('alpha.py', 'charge'), ('beta.py', 'tax')]),
+    ('import alpha as a\nfrom beta import tax as cost\nfrom beta import charge as unused\n'
+     'def test_value():\n    assert a.charge() + cost() == 4\n',
+     [('alpha.py', 'charge'), ('beta.py', 'tax')]),
+    ('import alpha as a\nfrom beta import charge as cost\ndef test_value(a):\n    a.tax()\n    cost()\n'
+     'def test_other():\n    a.charge()\n', [('alpha.py', 'charge'), ('beta.py', 'charge')]),
+    ('import alpha\ndef test_value():\n    a = alpha\n    a.tax()\n    alpha = object()\n    alpha.charge()\n', []),
+    ('def test_value():\n    import alpha as a\n    from beta import tax as cost\n    a.charge()\n    cost()\n',
+     [('alpha.py', 'charge'), ('beta.py', 'tax')]),
+    ('import alpha as a\nimport beta as a\ndef test_value():\n    a.charge()\n', []),
+    ('from beta import tax as cost\ndef test_value():\n    cost = object()\n    cost()\n', []),
+])
+def test_post_fix_callee_receiver_and_alias(tmp_path, test_source, expected):
+    code = 'def charge():\n    return 2\n\ndef tax():\n    return 2\n'
+    _budget_scope_fixture(tmp_path, {'alpha.py': code, 'beta.py': code})
+    _budget_scope_edit(tmp_path, 'tests/test_billing.py', test_source)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert not scope.prod_files and scope.test_files
+    assert [(item.rel_path, item.scope_name) for item in scope.callee_fallback_scopes] == expected
+
+
+@pytest.mark.parametrize('test_only', [False, True])
+def test_post_fix_root_src_collision_reports_reason(tmp_path, capsys, test_only):
+    _budget_scope_fixture(tmp_path, {
+        'billing.py': 'def charge():\n    return 2\n',
+        'src/billing.py': 'def charge():\n    return 3\n',
+        'tests/test_billing.py': 'import billing\ndef test_value():\n    assert billing.charge() == 3\n',
+    })
+    if test_only:
+        _budget_scope_edit(tmp_path, 'tests/test_billing.py',
+                           'import billing\ndef test_value():\n    assert billing.charge() in (2, 3)\n')
+    else:
+        _budget_scope_edit(tmp_path, 'src/billing.py', 'def charge():\n    return 4\n')
+    assert main(['--repo', str(tmp_path), '--mode', 'enforce', '--json']) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['verdict'] == 'ABSTAIN' and payload['run_mutants'] == 0
+    assert any(r.startswith('AMBIGUOUS_MODULE') and 'src/billing.py' in r for r in payload['reasons'])
+
+
+def test_post_fix_skipped_probes_distinguish_no_change_no_targets_and_failed_baseline(tmp_path, capsys):
+    _budget_scope_fixture(tmp_path, {'billing.py': 'def charge():\n    return 2\n'})
+    args = ['--repo', str(tmp_path), '--mode', 'enforce', '--json']
+    assert main([*args, '--base', 'HEAD']) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['verdict'] == 'PASS' and payload['baseline_execution'] is None
+    for name in ('idempotence_execution', 'concurrency_execution'):
+        assert payload[name] == {'status': 'SKIPPED', 'reason': 'NO_EXECUTABLE_SOURCE_CHANGES'}
+
+    _budget_scope_edit(tmp_path, 'billing.py', 'def charge():\n    return 3\n')
+    assert main(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['verdict'] == 'ABSTAIN' and payload['baseline_execution'] is None
+    assert payload['idempotence_execution']['reason'] == 'NO_TEST_TARGETS_SELECTED'
+
+    command = shlex.join([sys.executable, '-B', '-c', 'raise SystemExit(1)'])
+    assert main([*args, '--test-cmd', command]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['verdict'] == 'BASELINE_FAIL' and payload['baseline_execution']['returncode'] == 1
+    assert payload['idempotence_execution']['reason'] == 'BASELINE_DID_NOT_PASS'
+
+
+def test_boundary3_inherited_qa_test_is_collected_and_reported_as_unresolved(tmp_path, capsys):
+    path = 'qa/check_billing.py'
+    source = 'import pytest\nfrom contract_fixture import Contract\n\nclass TestInvoice(Contract):\n    pass\n'
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        'contract_fixture.py': 'class Contract:\n    def test_billing(self):\n        assert 2 + 2 == 4\n',
+        path: source,
+    })
+    _budget_scope_edit(tmp_path, path, source.replace(
+        'class TestInvoice', '@pytest.mark.skip(reason="test fixture")\nclass TestInvoice',
+    ))
+    collected = subprocess.run(
+        [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '--collect-only', '-q'],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+    )
+    assert f'{path}::TestInvoice::test_billing' in collected.stdout
+    assert '1 test collected' in collected.stdout
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert not any(item.rel_path == path for item in scope.prod_files)
+    assert any(reason.startswith('PYTEST_COLLECTION_AMBIGUOUS') and path in reason for reason in scope.issues)
+    assert main(['--repo', str(tmp_path), '--mode', 'enforce', '--json']) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['verdict'] == 'ABSTAIN' and report['total_mutants'] == 0
+    assert report['baseline_execution'] is None
+    assert report['idempotence_execution']['reason'] == 'PYTEST_COLLECTION_AMBIGUOUS'
+    assert any(path in reason for reason in report['reasons'])
+
+
+def test_boundary3_qa_helper_with_inheritance_keeps_production_scope(tmp_path):
+    path = 'qa/check_builder.py'
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        path: 'class Contract:\n    pass\n\nclass InvoiceBuilder(Contract):\n    def amount(self):\n        return 2\n',
+    })
+    _budget_scope_edit(tmp_path, path, (tmp_path / path).read_text().replace('return 2', 'return 3'))
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert not scope.issues and not scope.test_files
+    assert [(item.rel_path, item.scope_name) for item in scope.prod_scopes] == [(path, 'InvoiceBuilder.amount')]
+
+
+@pytest.mark.parametrize(('statement', 'expected'), [
+    ('assert all(alpha.charge() == n for n in (2, 2))\n    assert alpha.CALLS == 2',
+     [('alpha.py', 'charge')]),
+    ('fake = SimpleNamespace(charge=lambda: 9)\n'
+     '    assert all(alpha.charge() == 9 for alpha in (fake,))\n    assert alpha.CALLS == 0', []),
+    ('assert [alpha for alpha in alpha.amounts()] == [2, 2]',
+     [('alpha.py', 'amounts')]),
+    ('fake = SimpleNamespace(charge=lambda: 2)\n'
+     '    assert {alpha.charge() for row in (1,) for alpha in (fake,) if alpha.charge()} == {2}',
+     []),
+    ('assert {n: alpha.charge() for n in (2,)} == {2: 2}',
+     [('alpha.py', 'charge')]),
+    ('assert all(x == alpha.charge() for row in (1,) for x in alpha.amounts())',
+     [('alpha.py', 'charge'), ('alpha.py', 'amounts')]),
+])
+def test_boundary3_comprehension_binding_and_fallback(tmp_path, statement, expected):
+    _budget_scope_fixture(tmp_path, {
+        'alpha.py': 'CALLS = 0\n\ndef charge():\n    global CALLS\n    CALLS += 1\n    return 2\n\n'
+                    'def amounts():\n    return (2, 2)\n',
+    })
+    _budget_scope_edit(tmp_path, 'tests/test_billing.py',
+                       f'import alpha\nfrom types import SimpleNamespace\n\ndef test_billing():\n    {statement}\n')
+    native = subprocess.run(
+        [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '-q', 'tests/test_billing.py'],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+    )
+    assert '1 passed' in native.stdout
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert not scope.prod_files and not scope.issues
+    assert [(item.rel_path, item.scope_name) for item in scope.callee_fallback_scopes] == expected
+
+
+@pytest.mark.parametrize('collision', [False, True])
+def test_boundary3_default_and_explicit_pytest_bind_same_changed_source(tmp_path, capsys, collision):
+    files = {
+        'src/billing.py': 'def charge():\n    return 2\n',
+        'tests/test_billing.py': 'import billing\n\ndef test_charge():\n    assert billing.charge() == 0\n',
+    }
+    if collision:
+        files['billing.py'] = 'def charge():\n    return 5\n'
+    _budget_scope_fixture(tmp_path, files)
+    _budget_scope_edit(tmp_path, 'src/billing.py', 'def charge():\n    return 3\n')
+    pytest_command = shlex.join([sys.executable, '-B', '-m', 'pytest', 'tests/test_billing.py'])
+    args = ['--repo', str(tmp_path), '--mode', 'enforce', '--json']
+    for mode, extra in [('pytest', []), ('custom', ['--test-cmd', pytest_command])]:
+        rc = main([*args, *extra])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload['runner_mode'] == mode
+        if collision:
+            assert rc == 0 and payload['verdict'] == 'ABSTAIN'
+            assert payload['reasons'] == ['AMBIGUOUS_MODULE: billing (billing.py, src/billing.py)']
+            assert payload['baseline_execution'] is None and payload['run_mutants'] == 0
+        else:
+            assert rc == 1 and payload['verdict'] == 'BASELINE_FAIL'
+            assert payload['baseline_execution']['returncode'] == 1
+
+
+def test_boundary3_source_diagnostic_does_not_require_identifying_command_as_pytest(tmp_path, capsys):
+    _budget_scope_fixture(tmp_path, {
+        'billing.py': 'def charge():\n    return 2\n',
+        'src/billing.py': 'def charge():\n    return 3\n',
+    })
+    _budget_scope_edit(tmp_path, 'billing.py', 'def charge():\n    return 4\n')
+    command = shlex.join([sys.executable, '-B', '-c', 'raise SystemExit(17)'])
+    rc = main(['--repo', str(tmp_path), '--mode', 'enforce', '--json', '--test-cmd', command])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0 and payload['verdict'] == 'ABSTAIN'
+    assert payload['runner_mode'] == 'custom' and payload['baseline_execution'] is None
+    assert payload['reasons'] == ['AMBIGUOUS_MODULE: billing (billing.py, src/billing.py)']
+
+
+def _git_paths_cli(repo, *args):
+    command = [sys.executable, '-B', '-m', 'nocheat_gate.cli', '--repo', str(repo),
+               '--mode', 'enforce', '--json', *args]
+    # Exercise Git's default quoting regardless of the operator's configuration.
+    env = {**os.environ, 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+    result = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    assert result.stdout, (result.returncode, result.stderr)
+    return result.returncode, json.loads(result.stdout)
+
+
+def _git_changed_raw_paths(repo):
+    raw = subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-only', '-z', 'main', 'HEAD'])
+    assert raw.endswith(b'\0')
+    return tuple(path.decode('utf-8') for path in raw[:-1].split(b'\0'))
+
+
+@pytest.mark.parametrize('filename', ['check_billing.py', 'check_결제.py'])
+def test_git_paths_inherited_test_cli_keeps_diagnostic(tmp_path, filename):
+    rel = f'qa/{filename}'
+    source = 'import pytest\nfrom contract_fixture import Contract\n\nclass TestInvoice(Contract):\n    pass\n'
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        'contract_fixture.py': 'class Contract:\n    def test_billing(self):\n        assert 2 + 2 == 4\n',
+        rel: source,
+    })
+    _budget_scope_edit(tmp_path, rel, source.replace(
+        'class TestInvoice', '@pytest.mark.skip(reason="test fixture")\nclass TestInvoice',
+    ))
+    collected = subprocess.run(
+        [sys.executable, '-B', '-m', 'pytest', '-p', 'no:cacheprovider', '--collect-only', '-q'],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    assert '::TestInvoice::test_billing' in collected.stdout and '1 test collected' in collected.stdout
+    (git_path,) = _git_changed_raw_paths(tmp_path)
+    rc, payload = _git_paths_cli(tmp_path)
+    assert rc == 0 and payload['verdict'] == 'ABSTAIN', (rc, payload['verdict'], payload['reasons'])
+    assert payload['reasons'] == [f'PYTEST_COLLECTION_AMBIGUOUS: cannot establish test role for {git_path}']
+    assert payload['baseline_execution'] is None and payload['run_mutants'] == 0
+
+    rc, payload = _git_paths_cli(tmp_path, '--base', 'HEAD')
+    assert (rc, payload['verdict'], payload['reasons']) == (0, 'PASS', ['NO_EXECUTABLE_SOURCE_CHANGES'])
+
+
+def test_git_paths_korean_production_mutates_with_native_test(tmp_path):
+    rel = 'src/결제.py'
+    test = 'tests/test_결제.py'
+    _budget_scope_fixture(tmp_path, {
+        rel: 'def charge():\n    return 2\n',
+        test: 'from 결제 import charge\n\ndef test_charge():\n    assert charge() == 3\n',
+    })
+    _budget_scope_edit(tmp_path, rel, 'def charge():\n    return 3\n')
+    (git_path,) = _git_changed_raw_paths(tmp_path)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [(item.rel_path, item.scope_name) for item in scope.prod_scopes] == [(git_path, 'charge')]
+    rc, result = _git_paths_cli(tmp_path)
+    assert rc == 0 and result['verdict'] == 'PASS'
+    assert result['runner_mode'] == 'pytest' and result['run_mutants'] > 0
+    gate_result = evaluate_nocheat_gate(tmp_path, 'main', 'HEAD')
+    assert len(gate_result.targets) == 1 and 'test_' in gate_result.targets[0]
+
+
+def test_git_paths_literal_utf8_names_and_hunk_lines(tmp_path):
+    files = [
+        'sp ace.py', 't\tab.py', 'new\nline.py', 'double"quote.py', r'tests\backslash.py',
+        '[ab].py', 'a.py',
+    ]
+    original = 'def charge():\n    rate = 2\n    return rate\n'
+    _budget_scope_fixture(tmp_path, dict.fromkeys(files, original))
+    for name in files:
+        body = original.replace('rate = 2', 'rate = 3') if name != 'a.py' else original.replace('return rate', 'return 4')
+        (tmp_path / name).write_text(body, encoding='utf-8')
+    _git(tmp_path, 'add', '--', *files)
+    _git(tmp_path, 'commit', '-m', 'candidate: edit literal paths')
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    actual = {item.rel_path: item.added_lines for item in scope.prod_files}
+    expected = {path: {3} if path == 'a.py' else {2} for path in _git_changed_raw_paths(tmp_path)}
+    assert actual == expected and not scope.test_files
+
+
+def test_git_paths_rename_tracks_source_and_head_hunk(tmp_path):
+    old, new = 'billing.py', '결제 "\t.py'
+    body = 'def charge():\n    """Compute the amount without changing any other line."""\n    rate = 2\n    return rate\n'
+    _budget_scope_fixture(tmp_path, {old: body})
+    _git(tmp_path, 'mv', '--', old, new)
+    _budget_scope_edit(tmp_path, new, body.replace('rate = 2', 'rate = 3'))
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    (file,) = scope.prod_files
+    (actual_new,) = _git_changed_raw_paths(tmp_path)
+    assert (file.status, file.old_rel_path, file.rel_path, file.added_lines) == ('R', old, actual_new, {3})
+    assert [(item.rel_path, item.scope_name) for item in scope.prod_scopes] == [(actual_new, 'charge')]
+
+
+def test_git_paths_contract_checks_unicode_dependency(tmp_path):
+    contract = {'contracts': [{'target': 'billing:charge', 'inputs': {'amount': {'type': 'int', 'min': 1, 'max': 1}},
+                               'ensures': 'result == 2'}]}
+    _budget_scope_fixture(tmp_path, {
+        '.nocheat-contracts.json': json.dumps(contract),
+        'billing.py': 'from 결제 import rate\n\ndef charge(amount):\n    return amount * rate()\n',
+        '결제.py': 'def rate():\n    return 2\n',
+    })
+    _budget_scope_edit(tmp_path, '결제.py', 'def rate():\n    return 3\n')
+    rc, result = _git_paths_cli(tmp_path)
+    assert (rc, result['verdict'], result['contract_report']['status']) == (2, 'BLOCK', 'COUNTEREXAMPLE')
+    assert any(reason.startswith('CONTRACT_COUNTEREXAMPLE') for reason in result['reasons'])
+
+
+def test_git_paths_cannot_decode_committed_source(tmp_path):
+    _budget_scope_fixture(tmp_path, {'billing.py': 'def charge():\n    return 2\n'})
+    (tmp_path / 'billing.py').write_bytes(b'def charge():\n    return 3\n# \xff\n')
+    _git(tmp_path, 'add', 'billing.py')
+    _git(tmp_path, 'commit', '-m', 'candidate: source bytes outside UTF-8')
+    rc, result = _git_paths_cli(tmp_path)
+    assert rc == 0 and result['verdict'] == 'ABSTAIN'
+    assert any(reason.startswith('GIT_SOURCE_ENCODING_UNSUPPORTED') for reason in result['reasons'])
+
+
+def test_git_paths_cannot_decode_committed_name(tmp_path):
+    _budget_scope_fixture(tmp_path, {'billing.py': 'def charge():\n    return 2\n'})
+    blob = subprocess.check_output(['git', '-C', str(tmp_path), 'hash-object', '-w', '--stdin'],
+                                   input=b'def charge():\n    return 3\n').strip()
+    subprocess.run(['git', '-C', str(tmp_path), 'update-index', '-z', '--index-info'],
+                   input=b'100644 ' + blob + b'\tbad-\xff.py\0', check=True)
+    _git(tmp_path, 'commit', '-m', 'candidate: filename bytes outside UTF-8')
+    rc, result = _git_paths_cli(tmp_path)
+    assert rc == 0 and result['verdict'] == 'ABSTAIN' and result['baseline_execution'] is None
+    assert any(reason.startswith('GIT_PATH_ENCODING_UNSUPPORTED') for reason in result['reasons'])
+
+
+def test_git_paths_actual_copy_keeps_both_endpoints(tmp_path):
+    from nocheat_gate.diff_scope import git_path_changes
+
+    old, new = 'pricing.py', 'copy "\t\\가격.py'
+    body = 'def charge():\n    """Return the unchanged pricing formula for the copy fixture."""\n    rate = 2\n    return rate\n'
+    _budget_scope_fixture(tmp_path, {old: body})
+    (tmp_path / new).write_text(body, encoding='utf-8')
+    (tmp_path / old).write_text(body.replace('rate = 2', 'rate = 3'), encoding='utf-8')
+    _git(tmp_path, 'add', '--', old, new)
+    _git(tmp_path, 'commit', '-m', 'candidate: copy source and edit original')
+    changes = git_path_changes(tmp_path, 'main', 'HEAD')
+    (copied,) = [change for change in changes if change.status == 'C']
+    assert copied.old_rel_path == old and copied.rel_path in _git_changed_raw_paths(tmp_path)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert {result.rel_path: (result.status, result.added_lines) for result in scope.prod_files} == {
+        old: ('M', {3}), copied.rel_path: ('C', {1, 2, 3, 4}),
+    }
+
+
+def test_git_paths_rename_keeps_test_baseline_for_assertion_loss(tmp_path):
+    old, new = 'tests/test_billing.py', 'tests/test_결제.py'
+    source = ('from billing import charge\n\n'
+              'def test_charge():\n'
+              '    """Validate the charge independently of the name of this test file."""\n'
+              '    assert charge() == 2\n')
+    _budget_scope_fixture(tmp_path, {'billing.py': 'def charge():\n    return 2\n', old: source})
+    _git(tmp_path, 'mv', '--', old, new)
+    _budget_scope_edit(tmp_path, new, source.replace('assert charge() == 2', 'charge()'))
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    (file,) = scope.test_files
+    assert file.status == 'R' and file.base_rel_path == old
+    rc, report = _git_paths_cli(tmp_path)
+    assert rc == 2 and report['verdict'] == 'BLOCK' and 'POD003' in report['tier0_findings']
+
+
+def test_git_paths_rename_out_of_source_retains_test_deletion(tmp_path):
+    old, new = 'tests/test_billing.py', 'tests/checks.txt'
+    _budget_scope_fixture(tmp_path, {old: 'def test_charge():\n    assert sum((1, 1)) == 2\n'})
+    _git(tmp_path, 'mv', '--', old, new)
+    _git(tmp_path, 'commit', '-m', 'candidate: stop collecting the test as source')
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [(item.status, item.rel_path) for item in scope.test_files] == [('D', old)]
+    rc, report = _git_paths_cli(tmp_path)
+    assert rc == 2 and report['verdict'] == 'BLOCK' and 'POD001' in report['tier0_findings']
+
+
+@pytest.mark.parametrize('bad_record', [
+    b'M\0billing.py',
+    b'R100\0old.py\0',
+    b'C100\0old.py\0\0',
+    b'X\0billing.py\0',
+    b'R101\0old.py\0new.py\0',
+])
+def test_git_paths_invalid_metadata_rejected(bad_record):
+    from nocheat_gate.diff_scope import GitInputError, parse_git_path_changes
+
+    with pytest.raises(GitInputError, match='GIT_DIFF_METADATA_INVALID'):
+        parse_git_path_changes(bad_record)
+
+
+def test_git_paths_invalid_metadata_returns_normal_json(tmp_path, capsys, monkeypatch):
+    from nocheat_gate import diff_scope
+
+    _budget_scope_fixture(tmp_path, {'billing.py': 'def charge():\n    return 2\n'})
+    real_run = diff_scope._run_git
+
+    def malformed(repo, args):
+        if '--name-status' in args:
+            return b'R100\0old.py\0'
+        return real_run(repo, args)
+
+    monkeypatch.setattr(diff_scope, '_run_git', malformed)
+    assert main(['--repo', str(tmp_path), '--mode', 'enforce', '--json']) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload['verdict'] == 'ABSTAIN' and payload['baseline_execution'] is None
+    assert payload['reasons'] == ['GIT_DIFF_METADATA_INVALID: missing path in record 1']
+
+
+def _rename_roles_fixture(root):
+    body = 'from billing import charge\n\ndef test_invoice():\n    assert charge() == 2\n'
+    _budget_scope_fixture(root, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        'billing.py': 'def charge():\n    return 2\n',
+        'qa/check_invoice.py': body,
+        'qa/check_invoice_control.py': 'from billing import charge\n\ndef test_control():\n    assert charge() > 0\n',
+    })
+    return body
+
+
+def _rename_roles_move(root, old, new):
+    (root / new).parent.mkdir(parents=True, exist_ok=True)
+    _git(root, 'mv', '--', old, new)
+    _git(root, 'commit', '-m', 'candidate: move without editing source')
+
+
+@pytest.mark.parametrize('destination', [
+    'archive/check_invoice.py', 'qa/invoice.py', 'archive/test_invoice.py', 'archive/invoice.txt',
+])
+def test_rename_roles_lost_collection_blocks_both_runners(tmp_path, destination):
+    old = 'qa/check_invoice.py'
+    _rename_roles_fixture(tmp_path)
+    _rename_roles_move(tmp_path, old, destination)
+    raw = subprocess.check_output(['git', '-C', str(tmp_path), 'diff', '--name-status',
+                                   '-z', '--find-renames', 'main', 'HEAD'])
+    assert raw == f'R100\0{old}\0{destination}\0'.encode()
+    explicit = ['--test-cmd', shlex.join([sys.executable, '-B', '-m', 'pytest', '-q'])]
+    for args in ([], explicit):
+        rc, report = _git_paths_cli(tmp_path, *args)
+        assert (rc, report['verdict']) == (2, 'BLOCK'), report['reasons']
+        assert 'POD001' in report['tier0_findings']
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [(item.status, item.rel_path) for item in scope.test_files] == [('D', old)]
+
+
+def test_rename_roles_healthy_move_stays_a_test_rename(tmp_path):
+    old, new = 'qa/check_invoice.py', 'qa/check_청구.py'
+    _rename_roles_fixture(tmp_path)
+    _rename_roles_move(tmp_path, old, new)
+    (destination,) = _git_changed_raw_paths(tmp_path)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    (file,) = scope.test_files
+    assert (file.status, file.base_rel_path, file.rel_path) == ('R', old, destination)
+    assert not scope.prod_files
+    rc, report = _git_paths_cli(tmp_path)
+    assert (rc, report['verdict']) == (0, 'PASS')
+    assert 'POD001' not in report['tier0_findings']
+
+
+def test_rename_roles_copy_outside_collection_preserves_original_test(tmp_path):
+    from nocheat_gate.diff_scope import git_path_changes
+
+    old, new = 'qa/check_invoice.py', 'archive/check_invoice.py'
+    body = _rename_roles_fixture(tmp_path)
+    (tmp_path / new).parent.mkdir()
+    (tmp_path / new).write_text(body, encoding='utf-8')
+    (tmp_path / old).write_text(body + '\n# The original remains a collected test.\n', encoding='utf-8')
+    _git(tmp_path, 'add', '--', old, new)
+    _git(tmp_path, 'commit', '-m', 'candidate: keep original and archive a copy')
+    changes = git_path_changes(tmp_path, 'main', 'HEAD')
+    assert [(item.old_rel_path, item.rel_path) for item in changes if item.status == 'C'] == [(old, new)]
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert [(item.status, item.rel_path) for item in scope.test_files] == [('M', old)]
+    assert [(item.status, item.rel_path) for item in scope.prod_files] == [('C', new)]
+    _, report = _git_paths_cli(tmp_path)
+    assert 'POD001' not in report['tier0_findings']
+
+
+def test_rename_roles_production_to_test_has_no_old_test_baseline(tmp_path):
+    old, new = 'archive/check_invoice.py', 'qa/check_invoice.py'
+    body = ('import pytest\nfrom billing import charge\n\n'
+            '@pytest.mark.skip(reason="test fixture")\n'
+            'def test_invoice():\n    assert charge() == 2\n')
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        'billing.py': 'def charge():\n    return 2\n',
+        'qa/check_invoice_control.py': 'from billing import charge\n\ndef test_control():\n    assert charge() > 0\n',
+        old: body,
+    })
+    _rename_roles_move(tmp_path, old, new)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    (file,) = scope.test_files
+    assert (file.status, file.base_rel_path, file.rel_path) == ('A', new, new)
+    assert [(item.status, item.rel_path) for item in scope.prod_files] == [('D', old)]
+    rc, report = _git_paths_cli(tmp_path)
+    assert (rc, report['verdict']) == (2, 'BLOCK') and 'POD002' in report['tier0_findings']
+
+
+def test_rename_roles_product_move_stays_a_product_rename(tmp_path):
+    old, new = 'billing.py', 'invoicing.py'
+    _budget_scope_fixture(tmp_path, {old: 'def charge():\n    return 2\n'})
+    _rename_roles_move(tmp_path, old, new)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert not scope.test_files and not scope.issues
+    (file,) = scope.prod_files
+    assert (file.status, file.old_rel_path, file.rel_path, file.added_lines) == ('R', old, new, set())
+
+
+def test_rename_roles_uncertain_old_role_requests_review(tmp_path):
+    old, new = 'qa/check_invoice.py', 'archive/check_invoice.py'
+    _budget_scope_fixture(tmp_path, {
+        'pytest.ini': '[pytest]\ntestpaths = qa\npython_files = check_*.py\n',
+        'contract_fixture.py': 'class Contract:\n    def test_invoice(self):\n        assert 2 + 2 == 4\n',
+        old: 'from contract_fixture import Contract\n\nclass TestInvoice(Contract):\n    pass\n',
+        'qa/check_control.py': 'def test_control():\n    assert 2 + 2 == 4\n',
+    })
+    _rename_roles_move(tmp_path, old, new)
+    rc, report = _git_paths_cli(tmp_path)
+    assert (rc, report['verdict']) == (0, 'ABSTAIN')
+    assert report['reasons'] == [f'PYTEST_COLLECTION_AMBIGUOUS: cannot establish test role for {old}']
+    assert report['baseline_execution'] is None
+
+
+def _default_collection_fixture(root, path='tests/test_invoice.py', body=None):
+    body = body or 'def test_invoice():\n    amount = sum((1, 1))\n    assert amount == 2\n'
+    _budget_scope_fixture(root, {
+        'pytest.ini': '[pytest]\naddopts = -q\n',
+        'tests/test_control.py': 'def test_control():\n    amount = len([1, 2])\n    assert amount == 2\n',
+        path: body,
+    })
+    return body
+
+
+@pytest.mark.parametrize(('destination', 'expected'), [
+    ('tests/invoice.py', 'BLOCK'),
+    ('tests/test_청구.py', 'PASS'),
+    ('tests/invoice_test.py', 'PASS'),
+])
+def test_default_collection_r100_respects_pytest_filenames(tmp_path, destination, expected):
+    old = 'tests/test_invoice.py'
+    _default_collection_fixture(tmp_path)
+    _rename_roles_move(tmp_path, old, destination)
+    raw = subprocess.check_output(['git', '-C', str(tmp_path), 'diff', '--name-status',
+                                   '-z', '--find-renames', 'main', 'HEAD'])
+    (actual_destination,) = _git_changed_raw_paths(tmp_path)
+    assert raw == f'R100\0{old}\0{actual_destination}\0'.encode()
+    explicit = ['--test-cmd', shlex.join([sys.executable, '-B', '-m', 'pytest', '-q'])]
+    for args in ([], explicit):
+        rc, report = _git_paths_cli(tmp_path, *args)
+        assert (rc, report['verdict']) == ((2 if expected == 'BLOCK' else 0), expected), report['reasons']
+        assert ('POD001' in report['tier0_findings']) == (expected == 'BLOCK')
+
+
+def test_default_collection_uncollected_helper_stays_in_source_scope(tmp_path):
+    old, new = 'tests/invoice.py', 'tests/invoice_helpers.py'
+    _default_collection_fixture(tmp_path, old)
+    _rename_roles_move(tmp_path, old, new)
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert not scope.test_files and not scope.issues
+    assert [(item.status, item.base_rel_path, item.rel_path) for item in scope.prod_files] == [('R', old, new)]
+
+
+def test_default_collection_copy_preserves_collected_original(tmp_path):
+    from nocheat_gate.diff_scope import git_path_changes
+
+    old, new = 'tests/test_invoice.py', 'tests/test_copy.py'
+    body = _default_collection_fixture(tmp_path)
+    (tmp_path / new).write_text(body, encoding='utf-8')
+    (tmp_path / old).write_text(body + '\n# The original stays collected.\n', encoding='utf-8')
+    _git(tmp_path, 'add', '--', old, new)
+    _git(tmp_path, 'commit', '-m', 'candidate: keep original and add a collected copy')
+    changes = git_path_changes(tmp_path, 'main', 'HEAD')
+    assert [(item.old_rel_path, item.rel_path) for item in changes if item.status == 'C'] == [(old, new)]
+    scope = extract_diff_scope(tmp_path, 'main', 'HEAD')
+    assert {(item.status, item.rel_path) for item in scope.test_files} == {('M', old), ('C', new)}
+    rc, report = _git_paths_cli(tmp_path)
+    assert (rc, report['verdict']) == (0, 'PASS') and 'POD001' not in report['tier0_findings']
+
+
+def test_default_collection_unresolved_inherited_role_abstains(tmp_path):
+    old, new = 'tests/test_invoice.py', 'tests/invoice.py'
+    _default_collection_fixture(tmp_path, old, (
+        'class Contract:\n    def test_invoice(self):\n        assert sum((1, 1)) == 2\n'
+        '\nclass TestInvoice(Contract):\n    pass\n'
+    ))
+    _rename_roles_move(tmp_path, old, new)
+    rc, report = _git_paths_cli(tmp_path)
+    assert (rc, report['verdict']) == (0, 'ABSTAIN')
+    assert report['reasons'] == [f'PYTEST_COLLECTION_AMBIGUOUS: cannot establish test role for {old}']
+    assert report['baseline_execution'] is None
+
+
+def test_default_collection_legacy_script_still_runs(tmp_path):
+    _budget_scope_fixture(tmp_path, {
+        'billing.py': 'def amount():\n    return 2\n',
+        'test.py': 'from billing import amount\nassert amount() == 3\n',
+    })
+    _budget_scope_edit(tmp_path, 'billing.py', 'def amount():\n    return 3\n')
+    rc, report = _git_paths_cli(tmp_path)
+    assert (rc, report['verdict'], report['runner_mode']) == (0, 'PASS', 'script')
+    assert report['run_mutants'] > 0
 
 
 def test_impact_fallback_does_not_pull_unrelated_slow_tests(tmp_path: Path):

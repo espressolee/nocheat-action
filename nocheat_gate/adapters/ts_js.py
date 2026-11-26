@@ -130,7 +130,7 @@ def analyze_ts_js_diff(
     base_sources: dict[str, str] = {}
     head_sources: dict[str, str] = {}
     for tf in ts_tests:
-        b = git_show_file(repo_dir, base_ref, tf.rel_path)
+        b = git_show_file(repo_dir, base_ref, tf.base_rel_path)
         if b is not None:
             base_sources[tf.rel_path] = b
         if tf.status != "D":

@@ -41,6 +41,74 @@ nocheat-gate --repo . --base main --head HEAD --mode observe --json
 nocheat-gate --repo . --base main --head HEAD --mode observe --baseline-timeout 45
 ```
 
+For projects using pytest, NoCheat uses the base revision’s `python_files` and
+`testpaths` settings to select test targets. Configure them in `pytest.ini` or `[tool.pytest.ini_options]` in `pyproject.toml`.
+Land changes to test naming separately so the next source PR uses the reviewed
+patterns. Files in a dedicated collection directory can qualify for test
+soundness checks when their source declares standard tests. An ambiguous
+collection configuration, competing module paths, or an exhausted discovery
+inventory requests review with a diagnostic. In a nonstandard collection
+directory, a test class with inherited or metaclass-provided methods needs
+review before the gate can establish its role. The test soundness check
+examines locally declared test bodies.
+
+For a script-based test suite,
+pass an explicit test command in the CLI or set the `test-cmd` Action input.
+
+```bash
+nocheat-gate --repo . --base main --head HEAD --test-cmd 'python3 -B selftest.py'
+```
+
+The command takes an argv list. Give it exit status 0 for success and 1 for an
+ordinary test failure. Runner launch errors and other nonzero custom exits remain
+unscored for mutants. The baseline and each mutant start in a fresh copy of the
+checkout, which isolates files written within that copy. Use a test environment
+appropriate for the repository code and its external dependencies.
+
+The gate checks changed Python modules and statically identified fallback
+modules for competing root and src checkout paths before either runner
+starts. A conflict requests review before any baseline command can run.
+This source check covers those identified modules. Automatic pytest
+discovery also checks the modules in its bounded discovery inventory.
+
+Test-only changes use statically bound imports to identify product
+functions. Direct calls in comprehensions respect their local iteration
+variables. Dynamic aliases and runtime import behavior are outside this analysis.
+
+Git change records preserve UTF-8 filenames, including rename and copy
+paths. The gate reports ABSTAIN when Git metadata is malformed or a
+changed path or source cannot be read as supported UTF-8 input.
+Both ends of a rename use the reviewed base pytest collection rules.
+A test that leaves that collection is checked as a removal, even when
+Git reports identical file content.
+With the default pytest filename rules, a test module must match
+`test_*.py` or `*_test.py`. An unresolved test body on a moved file
+requests review.
+
+An individual mutant timeout can count as a kill when its deadline is clearly
+responsible. The mutation score excludes results that arrive after the overall
+deadline or whose timeout cause is uncertain. The JSON `mutation_execution` object
+reports the unscored counts.
+
+Custom commands skip the built-in in-process idempotence and scheduled concurrency
+probes. Changes that trigger concurrency analysis get `ABSTAIN` if no other
+evidence determines the verdict. Other changes may earn `PASS` from applicable
+checks. In JSON, use `idempotence_execution` and `concurrency_execution`
+to tell whether each probe ran. The legacy `idempotent` and `concurrency_verdict` fields remain available.
+
+To prepare an explicit contract, give the scaffold command a Python function,
+bounded argument domains, and a postcondition you can review.
+
+```bash
+nocheat-gate init-contract --repo . --target billing:charge \
+  --inputs '{"units":{"type":"int","min":1,"max":100},"premium":{"type":"bool"}}' \
+  --ensures 'result == units * (2 if premium else 3)'
+```
+
+The command validates the generated `.nocheat-contracts.json` and preserves any
+existing file. Review and land it on the base branch before evaluating source
+changes against it.
+
 ---
 
 ## Live `ubuntu-latest` PR Check Behavior (`examples/billing.py` Demo)

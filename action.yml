@@ -31,6 +31,10 @@ inputs:
     description: 'Baseline test timeout in seconds (defaults to 15s; override for heavy DB/app fixtures)'
     required: false
     default: ''
+  test-cmd:
+    description: 'Optional test command for Python changes, parsed as arguments without a shell'
+    required: false
+    default: ''
 
 branding:
   icon: 'shield'
@@ -50,6 +54,7 @@ runs:
         INPUT_PYTHON: ${{ inputs.python-bin }}
         INPUT_JSON: ${{ inputs.json }}
         INPUT_BASELINE_TIMEOUT: ${{ inputs.baseline-timeout }}
+        INPUT_TEST_CMD: ${{ inputs.test-cmd }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         PR_BASE_REF: ${{ github.base_ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -94,11 +99,29 @@ runs:
         if [ -n "${INPUT_BASELINE_TIMEOUT:-}" ]; then
           EXTRA_ARGS+=(--baseline-timeout "$INPUT_BASELINE_TIMEOUT")
         fi
+        if [ -n "${INPUT_TEST_CMD:-}" ]; then
+          EXTRA_ARGS+=("--test-cmd=$INPUT_TEST_CMD")
+        fi
 
         echo "::group::NoCheat Merge Gate ($TARGET_MODE mode: $TARGET_BASE..$TARGET_HEAD)"
         set +e
-        PYTHONPATH="${{ github.action_path }}${PYTHONPATH:+:$PYTHONPATH}" \
-          "$PYTHON_BIN" -B -m nocheat_gate.cli \
+        "$PYTHON_BIN" -I -B -c '
+        import importlib.util
+        from pathlib import Path
+        import runpy
+        import sys
+
+        root = Path(sys.argv.pop(1)).resolve(strict=True)
+        sys.path.insert(0, str(root))
+        spec = importlib.util.find_spec("nocheat_gate")
+        if spec is None or spec.origin is None or Path(spec.origin).resolve() != root / "nocheat_gate" / "__init__.py":
+            raise SystemExit("NoCheat Action package is unavailable at its trusted path")
+        entrypoint = importlib.util.find_spec("nocheat_gate.cli")
+        if (entrypoint is None or entrypoint.origin is None
+                or Path(entrypoint.origin).resolve() != root / "nocheat_gate" / "cli.py"):
+            raise SystemExit("NoCheat Action entrypoint is unavailable at its trusted path")
+        runpy.run_module(entrypoint.name, run_name="__main__", alter_sys=True)
+        ' "$NOCHEAT_RUNTIME_ROOT" \
           --repo "$TARGET_REPO" \
           --base "$TARGET_BASE" \
           --head "$TARGET_HEAD" \

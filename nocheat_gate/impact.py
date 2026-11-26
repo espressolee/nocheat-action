@@ -2,13 +2,15 @@
 from __future__ import annotations
 import argparse
 import ast
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import builtins
+from itertools import islice
 import os
 
-from .diff_scope import is_test_path
+from .diff_scope import ambiguous_module_reason, matches_pytest_file, python_module_name, python_module_paths
 
 
 @dataclass(frozen=True)
@@ -19,34 +21,49 @@ class ImpactReport:
     edges: tuple[tuple[str, str], ...]
     fallback: bool
     issues: tuple[str, ...]
+    candidates: tuple[str, ...] = ()
 
 
-def analyze_impact(root: Path, prod_files, scopes=()) -> ImpactReport:
+def _python_paths(root: Path):
+    ignored = {'node_modules', 'out', 'build', 'dist', 'fixtures', 'testdata', '__pycache__'}
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d not in ignored)
+        for name in sorted(files):
+            if name.endswith('.py') and not name.startswith('.'):
+                yield Path(directory) / name
+
+
+def source_module_collisions(root: Path, source_paths: Iterable[str]) -> tuple[str, ...]:
+    """Check known changed or fallback source identities before either runner starts."""
+    modules = {python_module_name(path) for path in source_paths if path.endswith('.py')}
+    issues = []
+    for name in sorted(modules - {''}):
+        paths = [path for path in python_module_paths(name) if (root / path).is_file()]
+        if len(paths) > 1:
+            issues.append(ambiguous_module_reason(name, paths))
+    return tuple(issues)
+
+
+def analyze_impact(root: Path, prod_files, scopes=(), *, pytest_python_files=None, pytest_testpaths=()) -> ImpactReport:
     root=root.resolve(); modules={}; trees={}; definitions={}; bindings={}; globals_by_file={}; issues=[]; edges=set()
-    paths=[]
-    inventory=[]
-    for directory,dirs,files in os.walk(root,followlinks=False):
-        dirs[:]=sorted(d for d in dirs if not d.startswith('.') and d not in {'node_modules','out','build','dist','fixtures','testdata','__pycache__'})
-        inventory.extend(Path(directory)/name for name in sorted(files) if name.endswith('.py'))
-        if len(inventory)>512:break
-    for p in inventory:
-        rel=p.relative_to(root)
-        if any(part.startswith('.') or part in {'node_modules','out','build','dist','fixtures','testdata','__pycache__'} for part in rel.parts):continue
-        paths.append(p)
-        if len(paths)>512: issues.append('MODULE_LIMIT'); break
+    paths = list(islice(_python_paths(root), 513))
+    if len(paths) > 512:
+        return ImpactReport((), (), (), (), True, ('MODULE_LIMIT',))
     def pytest_file(p):
+        if pytest_python_files is not None:
+            rel = p.relative_to(root).as_posix()
+            return matches_pytest_file(rel, pytest_python_files, pytest_testpaths)
         return p.name.startswith('test_') or p.name.endswith('_test.py') or p.name in {'test.py','tests.py'}
-    candidates=tuple(str(p.relative_to(root)) for p in paths if is_test_path(str(p.relative_to(root))) and pytest_file(p))
+    candidates=tuple(str(p.relative_to(root)) for p in paths if pytest_file(p))
     def node(rel,name):return rel+':'+name
     for p in paths:
         rel=p.relative_to(root).as_posix()
         if p.is_symlink() or p.stat().st_size>131072:
             issues.append('SOURCE_UNAVAILABLE:'+rel);continue
-        parts=list(p.relative_to(root).with_suffix('').parts)
-        if parts[0]=='src':parts=parts[1:]
-        if parts[-1]=='__init__':parts=parts[:-1]
-        module='.'.join(parts)
-        if module in modules:issues.append('AMBIGUOUS_MODULE:'+module)
+        module = python_module_name(rel)
+        if module in modules:
+            reason = ambiguous_module_reason(module, [modules[module], rel])
+            return ImpactReport((), (), (), (), True, (reason,), candidates)
         modules[module]=rel
         try: trees[rel]=ast.parse(p.read_text(),filename=rel)
         except (SyntaxError,UnicodeError,OSError):issues.append('PARSE_UNAVAILABLE:'+rel)
@@ -167,8 +184,7 @@ def analyze_impact(root: Path, prod_files, scopes=()) -> ImpactReport:
     if any(key.split(':',1)[0].endswith('conftest.py') for key in impacted):
         issues.append('IMPLICIT_PYTEST_FIXTURE');fallback=True
     tests=set(candidates) if fallback else {key.split(':',1)[0] for key in impacted if key.split(':',1)[0] in candidates}
-    if 'MODULE_LIMIT' in issues:tests={'.'}
-    return ImpactReport(tuple(sorted(changed)),tuple(sorted(impacted)),tuple(sorted(tests)),tuple(sorted(edges)),fallback,tuple(sorted(set(issues))))
+    return ImpactReport(tuple(sorted(changed)),tuple(sorted(impacted)),tuple(sorted(tests)),tuple(sorted(edges)),fallback,tuple(sorted(set(issues))),candidates)
 
 
 def main():
@@ -177,6 +193,9 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--repo',type=Path,required=True);p.add_argument('--base',required=True);p.add_argument('--head',required=True);a=p.parse_args()
     scope=extract_diff_scope(a.repo,a.base,a.head)
     with temporary_checkout(a.repo,a.head) as root:
-        report=analyze_impact(root,scope.prod_files,scope.prod_scopes)
-    print(json.dumps(asdict(report),indent=2))
+        report = analyze_impact(root, scope.prod_files, scope.prod_scopes,
+                                pytest_python_files=scope.pytest_python_files, pytest_testpaths=scope.pytest_testpaths)
+    payload = asdict(report)
+    payload.pop('candidates')
+    print(json.dumps(payload, indent=2))
 if __name__=='__main__':main()

@@ -276,9 +276,9 @@ def analyze_python_prod_doctests(
     """Detect tampered `>>>` doctest expected outputs in existing production functions."""
     findings: list[Tier0Finding] = []
     for pf in prod_files:
-        if pf.status in {"A", "D"} or not pf.rel_path.endswith(".py"):
+        if pf.status in {"A", "C", "D"} or not pf.rel_path.endswith(".py"):
             continue
-        b_doc = _extract_doctest_pairs(git_show_file(repo_dir, base_ref, pf.rel_path))
+        b_doc = _extract_doctest_pairs(git_show_file(repo_dir, base_ref, pf.base_rel_path))
         h_doc = _extract_doctest_pairs(git_show_file(repo_dir, head_ref, pf.rel_path))
         for fn_name, b_pairs in b_doc.items():
             h_pairs = h_doc.get(fn_name, [])
@@ -313,7 +313,7 @@ def is_test_suite_degraded(
         return False
     base_exact = base_weak = head_exact = head_weak = 0
     for tf in py_tests:
-        b_list = _extract_python_tests(tf.rel_path, git_show_file(repo_dir, base_ref, tf.rel_path))
+        b_list = _extract_python_tests(tf.rel_path, git_show_file(repo_dir, base_ref, tf.base_rel_path))
         h_list = [] if tf.status == "D" else _extract_python_tests(
             tf.rel_path, git_show_file(repo_dir, head_ref, tf.rel_path)
         )
@@ -345,7 +345,7 @@ def analyze_python_test_diff(
     findings: list[Tier0Finding] = []
 
     for tf in py_tests:
-        b_src = git_show_file(repo_dir, base_ref, tf.rel_path)
+        b_src = git_show_file(repo_dir, base_ref, tf.base_rel_path)
         h_src = None if tf.status == "D" else git_show_file(repo_dir, head_ref, tf.rel_path)
         if tf.status == "D" and b_src is not None:
             parsed_b = _extract_python_tests(tf.rel_path, b_src)

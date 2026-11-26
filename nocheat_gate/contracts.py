@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .stateful import SequenceCounterexample
 
-from .diff_scope import git_show_file
+from .diff_scope import GitInputError, git_path_changes, git_show_file
 from .runner import temporary_checkout
 from .expressions import HELPERS as _HELPERS, expression as _expression, holds as _holds
 from .json_values import (accepts, complexity, fingerprint, reductions, samples,
@@ -144,6 +144,21 @@ def _load_contracts(raw: str) -> tuple[list[dict], tuple[str, ...]]:
         contract['_ensures'] = _expression(contract['ensures'], set(inputs) | {'result'})
         contract['_execution'] = execution
     return contracts, roots
+
+
+def write_contract_scaffold(repo: Path, contract: dict, source_roots: list[str]) -> Path:
+    """Validate and publish a candidate contract without overwriting any existing path."""
+    document = {'contracts': [contract]}
+    if source_roots:
+        document['source_roots'] = source_roots
+    raw = json.dumps(document, indent=2, ensure_ascii=True) + '\n'
+    _load_contracts(raw)
+    destination = repo / CONTRACT_PATH
+    with tempfile.TemporaryDirectory(prefix='.nocheat-init-', dir=repo) as tmp:
+        candidate = Path(tmp) / CONTRACT_PATH
+        candidate.write_text(raw, encoding='utf-8')
+        os.link(candidate, destination)
+    return destination
 
 
 def _prefixes(root: Path, source_roots: tuple[str, ...]) -> list[Path]:
@@ -281,7 +296,7 @@ def check_contracts(
     try:
         raw = git_show_file(repo, base, CONTRACT_PATH)
         head_raw = git_show_file(repo, head, CONTRACT_PATH)
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, GitInputError):
         return ContractReport(status='INCONCLUSIVE', reasons=('CONTRACT_BYTES_UNREADABLE',),
                               base_commit=base, head_commit=head)
     digest = hashlib.sha256(raw.encode()).hexdigest() if raw is not None else None
@@ -362,10 +377,10 @@ def check_contracts(
                 'reason': verdict.reason,
                 'agreement': verdict.agreement,
             })
-        changed = set(subprocess.run(
-            ['git', '-C', str(repo), 'diff', '--name-only', base, head], check=True,
-            capture_output=True, text=True,
-        ).stdout.splitlines())
+        changes = git_path_changes(repo, base, head)
+        changed = {change.rel_path for change in changes}
+        changed.update(change.old_rel_path for change in changes
+                       if change.status == 'R' and change.old_rel_path is not None)
         with temporary_checkout(repo, base) as before, temporary_checkout(repo, head) as after:
             def execute(root, *args, **kwargs):
                 if native_pythons is None:

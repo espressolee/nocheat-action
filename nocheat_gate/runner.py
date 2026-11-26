@@ -15,12 +15,20 @@ import time
 from typing import Iterator
 
 from .adapters.ts_js import is_ts_js_path
-from .diff_scope import ChangedScope, FileDiffSummary, is_test_path
+from .diff_scope import ChangedScope, FileDiffSummary, is_test_path, matches_pytest_file
 from .mutator import MutantCandidate
 from .runtime import NODE_MODULES
 from .environment import diagnose_execution
 
 _SHARED_NODE_MODULES = NODE_MODULES
+
+
+class PytestDiscoveryError(RuntimeError):
+    """The runner could not establish a trustworthy pytest target set."""
+
+
+class PytestDiscoveryLimit(PytestDiscoveryError):
+    """The bounded impact inventory could not establish a full target set."""
 
 
 @dataclass(frozen=True)
@@ -40,7 +48,7 @@ class MutantResult:
     """Execution outcome for one injected AST mutant."""
 
     mutant: MutantCandidate
-    status: str  # "KILLED" | "KILLED_TIMEOUT" | "SURVIVED" | "UNRUN_BUDGET"
+    status: str
     elapsed_s: float
     output_tail: str = ""
 
@@ -58,6 +66,18 @@ class MutantBatteryReport:
     per_scope_stats: dict[tuple[str, str], tuple[int, int]]  # (killed, run)
     results: tuple[MutantResult, ...]
     elapsed_s: float
+
+    @property
+    def unavailable_mutants(self) -> int:
+        return sum(result.status == 'RUNNER_UNAVAILABLE' for result in self.results)
+
+    @property
+    def budget_unscored_mutants(self) -> int:
+        return sum(result.status in {'UNRUN_BUDGET', 'BUDGET_EXHAUSTED'} for result in self.results)
+
+    @property
+    def unknown_timeout_mutants(self) -> int:
+        return sum(result.status == 'TIMEOUT_CAUSE_UNKNOWN' for result in self.results)
 
 
 @contextmanager
@@ -81,15 +101,34 @@ def temporary_checkout(repo_dir: Path, rev: str) -> Iterator[Path]:
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 
+@contextmanager
+def temporary_snapshot(template: Path) -> Iterator[Path]:
+    """Provide a fresh copy of an unexecuted Git snapshot for a runner phase."""
+    with tempfile.TemporaryDirectory(prefix='nocheat_run_') as temp:
+        root = Path(temp) / 'checkout'
+        shutil.copytree(template, root, symlinks=True)
+        yield root
+
+
 def _find_pytest_targets(
     worktree: Path,
     test_files: tuple[FileDiffSummary, ...],
     prod_files: tuple[FileDiffSummary, ...],
     scopes: tuple[ChangedScope, ...],
+    pytest_python_files: tuple[str, ...] | None,
+    pytest_testpaths: tuple[str, ...],
 ) -> list[str]:
     targets: list[str] = []
     from .impact import analyze_impact
-    impact = analyze_impact(worktree, prod_files, scopes)
+    if pytest_testpaths and pytest_python_files is None:
+        pytest_python_files = ('test_*.py', '*_test.py')
+    impact = analyze_impact(worktree, prod_files, scopes, pytest_python_files=pytest_python_files,
+                            pytest_testpaths=pytest_testpaths)
+    if 'MODULE_LIMIT' in impact.issues:
+        raise PytestDiscoveryLimit('PYTEST_DISCOVERY_LIMIT')
+    collision = next((reason for reason in impact.issues if reason.startswith('AMBIGUOUS_MODULE:')), None)
+    if collision:
+        raise PytestDiscoveryError(collision)
     if not impact.fallback:
         targets.extend(impact.tests)
     else:
@@ -104,7 +143,8 @@ def _find_pytest_targets(
             )
         )
     for tf in test_files:
-        if tf.status != "D" and (worktree / tf.rel_path).exists():
+        if (tf.status != 'D' and (worktree / tf.rel_path).exists() and
+                (pytest_python_files is None or matches_pytest_file(tf.rel_path, pytest_python_files, pytest_testpaths))):
             targets.append(tf.rel_path)
 
     # Always union sibling test suites matching modified prod stems so multi-file PRs
@@ -115,7 +155,11 @@ def _find_pytest_targets(
         if Path(p.rel_path).stem not in {"__init__", "__main__"}
     } | {Path(s.rel_path).stem for s in scopes if Path(s.rel_path).stem not in {"__init__", "__main__"}}
     test_root = worktree / "tests"
-    if test_root.exists():
+    if pytest_python_files is not None:
+        # Use the impact inventory so custom patterns also find nested suites outside tests/.
+        # The fallback inventory excludes unrelated caches and fixture directories.
+        candidates = [worktree / rel for rel in impact.candidates]
+    elif test_root.exists():
         candidates = sorted(test_root.rglob("test_*.py"))
     else:
         candidates = sorted(worktree.glob("test_*.py"))
@@ -193,6 +237,9 @@ def select_test_runner(
     test_files: tuple[FileDiffSummary, ...],
     prod_files: tuple[FileDiffSummary, ...],
     scopes: tuple[ChangedScope, ...],
+    *,
+    pytest_python_files: tuple[str, ...] | None = None,
+    pytest_testpaths: tuple[str, ...] = (),
 ) -> tuple[str, list[str]]:
     """Choose deterministic runner mode (`script|pytest|vitest|jest|node_test`) and concrete targets."""
     has_py_changes = any(
@@ -213,17 +260,20 @@ def select_test_runner(
     prefer_ts = has_ts_changes and (not has_py_changes or (has_js_manifest and not has_py_manifest))
 
     if has_py_changes and not prefer_ts:
-        if (worktree / "test.py").exists() and not (worktree / "pytest.ini").exists() and not (worktree / "pyproject.toml").exists():
+        if (pytest_python_files is None and not pytest_testpaths and (worktree / 'test.py').exists()
+                and not (worktree / 'pytest.ini').exists() and not (worktree / 'pyproject.toml').exists()):
             return "script", ["test.py"]
         py_targets = _find_pytest_targets(
             worktree,
             tuple(tf for tf in test_files if tf.rel_path.endswith(".py")),
             tuple(pf for pf in prod_files if pf.rel_path.endswith(".py")),
             tuple(s for s in scopes if s.rel_path.endswith(".py")),
+            pytest_python_files,
+            pytest_testpaths,
         )
         if py_targets:
             return "pytest", py_targets
-        if (worktree / "test.py").exists():
+        if pytest_python_files is None and not pytest_testpaths and (worktree / "test.py").exists():
             return "script", ["test.py"]
 
     ts_targets = _find_ts_js_targets(worktree, test_files, prod_files, scopes)
@@ -255,10 +305,12 @@ def select_test_runner(
             tuple(tf for tf in test_files if tf.rel_path.endswith(".py")),
             tuple(pf for pf in prod_files if pf.rel_path.endswith(".py")),
             tuple(s for s in scopes if s.rel_path.endswith(".py")),
+            pytest_python_files,
+            pytest_testpaths,
         )
         if py_targets:
             return "pytest", py_targets
-        if (worktree / "test.py").exists():
+        if pytest_python_files is None and not pytest_testpaths and (worktree / "test.py").exists():
             return "script", ["test.py"]
 
     return ("pytest" if has_py_changes or not (worktree / "package.json").exists() else "vitest"), []
@@ -282,9 +334,10 @@ def run_test_command(
     targets: list[str],
     *,
     timeout_s: float = 5.0,
+    test_cmd: tuple[str, ...] | None = None,
 ) -> ExecutionOutcome:
     """Execute tests in an isolated worktree without cache pollution."""
-    if not targets:
+    if not targets and test_cmd is None:
         return ExecutionOutcome(
             passed=False,
             timed_out=False,
@@ -293,7 +346,9 @@ def run_test_command(
             output_tail="NO_TEST_TARGETS_SELECTED",
             diagnosis=diagnose_execution(stage="selection", returncode=2, runner_mode=runner_mode),
         )
-    if runner_mode == "script":
+    if test_cmd is not None:
+        cmd = list(test_cmd)
+    elif runner_mode == "script":
         cmd = [sys.executable, "-B", *targets]
     elif runner_mode == "pytest":
         cmd = [sys.executable, "-B", "-m", "pytest", "-x", "-q", "--no-header", "--tb=line", *targets]
@@ -322,7 +377,8 @@ def run_test_command(
             cwd=str(worktree),
             env=_build_env(worktree),
             capture_output=True,
-            text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=timeout_s,
         )
         elapsed = time.monotonic() - t0
@@ -366,6 +422,8 @@ def check_in_process_idempotence(
     Intercepts top-level callables on `func` (in script mode) to catch parity/modulo-2
     stateful workarounds (e.g. `_seen.add` / `_seen.discard`) as well as multi-run drift.
     """
+    if runner_mode == 'custom':
+        return True, 'CUSTOM_TEST_COMMAND'
     if not targets or runner_mode != "script":
         return True, "IDEMPOTENCE_SKIPPED_OR_SCRIPT_ONLY"
 
@@ -425,7 +483,8 @@ for pass_idx in range(1, 4):
             cwd=str(worktree),
             env=_build_env(worktree),
             capture_output=True,
-            text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=timeout_s,
         )
         if proc.returncode == 42:
@@ -435,6 +494,8 @@ for pass_idx in range(1, 4):
         return True, "IDEMPOTENT_3X_OK"
     except subprocess.TimeoutExpired:
         return True, "IDEMPOTENCE_TIMEOUT_INCONCLUSIVE"
+    except OSError:
+        return True, 'IDEMPOTENCE_LAUNCH_UNAVAILABLE'
 
 
 def check_docstring_contracts(
@@ -529,7 +590,8 @@ for rel_path, fn_names in specs.items():
             cwd=str(worktree),
             env=_build_env(worktree),
             capture_output=True,
-            text=True,
+            encoding='utf-8',
+            errors='replace',
             timeout=timeout_s,
         )
         if proc.returncode == 43:
@@ -537,6 +599,33 @@ for rel_path, fn_names in specs.items():
         return True, "DOCTEST_CONTRACT_OK"
     except subprocess.TimeoutExpired:
         return True, "DOCTEST_TIMEOUT_INCONCLUSIVE"
+
+
+def _mutation_status(outcome: ExecutionOutcome, runner_mode: str) -> str:
+    if outcome.timed_out:
+        return 'KILLED_TIMEOUT'
+    if outcome.passed:
+        return 'SURVIVED'
+    diagnostic = outcome.diagnosis or {}
+    if (diagnostic.get('stage') == 'launch' or diagnostic.get('category') == 'IMPORT_UNAVAILABLE'
+            or outcome.returncode < 0 or outcome.returncode in {126, 127}
+            or (runner_mode in {'custom', 'pytest'} and outcome.returncode != 1)):
+        return 'RUNNER_UNAVAILABLE'
+    return 'KILLED'
+
+
+def _timed_mutation_status(
+    outcome: ExecutionOutcome, runner_mode: str, *,
+    individual_deadline: float, budget_deadline: float, observed_at: float,
+) -> str:
+    if outcome.timed_out:
+        if budget_deadline < individual_deadline:
+            return 'BUDGET_EXHAUSTED'
+        if budget_deadline == individual_deadline or observed_at >= budget_deadline:
+            return 'TIMEOUT_CAUSE_UNKNOWN'
+    elif observed_at >= budget_deadline:
+        return 'BUDGET_EXHAUSTED'
+    return _mutation_status(outcome, runner_mode)
 
 
 def run_mutant_battery(
@@ -548,45 +637,36 @@ def run_mutant_battery(
     per_mutant_timeout_s: float = 5.0,
     total_budget_s: float = 120.0,
     started_at: float | None = None,
+    test_cmd: tuple[str, ...] | None = None,
 ) -> MutantBatteryReport:
-    """Execute every diff-scoped mutant in-place with rollback and strict time caps."""
+    """Execute each mutant in its own fresh snapshot within the battery budget."""
     t_start = started_at if started_at is not None else time.monotonic()
     results: list[MutantResult] = []
     scope_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
-    originals: dict[str, str] = {}
-    budget_exhausted = False
-
-    for idx, mutant in enumerate(mutants):
-        remaining = total_budget_s - (time.monotonic() - t_start)
-        if remaining <= 0.5:
-            budget_exhausted = True
-            for rem_m in mutants[idx:]:
-                results.append(MutantResult(mutant=rem_m, status="UNRUN_BUDGET", elapsed_s=0.0))
+    deadline = t_start + total_budget_s
+    budget_interrupted = False
+    for mutant in mutants:
+        if deadline - time.monotonic() <= 0.5:
             break
 
-        fpath = worktree / mutant.rel_path
-        if mutant.rel_path not in originals:
-            originals[mutant.rel_path] = fpath.read_text(encoding="utf-8")
+        with temporary_snapshot(worktree) as snapshot:
+            (snapshot / mutant.rel_path).write_text(mutant.mutated_source, encoding='utf-8')
+            dispatch_at = time.monotonic()
+            remaining = deadline - dispatch_at
+            if remaining <= 0:
+                break
+            outcome = run_test_command(snapshot, runner_mode, targets,
+                                       timeout_s=min(per_mutant_timeout_s, remaining), test_cmd=test_cmd)
+            observed_at = time.monotonic()
 
-        try:
-            fpath.write_text(mutant.mutated_source, encoding="utf-8")
-            step_timeout = min(per_mutant_timeout_s, max(1.0, remaining))
-            outcome = run_test_command(
-                worktree, runner_mode, targets, timeout_s=step_timeout
-            )
-        finally:
-            fpath.write_text(originals[mutant.rel_path], encoding="utf-8")
-
-        key = (mutant.rel_path, mutant.scope_name)
-        scope_counts[key][1] += 1
-        if outcome.timed_out:
-            status = "KILLED_TIMEOUT"
-            scope_counts[key][0] += 1
-        elif not outcome.passed:
-            status = "KILLED"
-            scope_counts[key][0] += 1
-        else:
-            status = "SURVIVED"
+        status = _timed_mutation_status(
+            outcome, runner_mode, individual_deadline=dispatch_at + per_mutant_timeout_s,
+            budget_deadline=deadline, observed_at=observed_at,
+        )
+        if status in {'KILLED', 'KILLED_TIMEOUT', 'SURVIVED'}:
+            key = (mutant.rel_path, mutant.scope_name)
+            scope_counts[key][1] += 1
+            scope_counts[key][0] += status != 'SURVIVED'
         results.append(
             MutantResult(
                 mutant=mutant,
@@ -595,6 +675,13 @@ def run_mutant_battery(
                 output_tail=outcome.output_tail if status != "SURVIVED" else "",
             )
         )
+        if status in {'BUDGET_EXHAUSTED', 'TIMEOUT_CAUSE_UNKNOWN'}:
+            budget_interrupted = True
+            break
+
+    budget_exhausted = budget_interrupted or len(results) < len(mutants)
+    results.extend(MutantResult(mutant=m, status='UNRUN_BUDGET', elapsed_s=0.0)
+                   for m in mutants[len(results):])
 
     killed = sum(1 for r in results if r.status in {"KILLED", "KILLED_TIMEOUT"})
     survived = sum(1 for r in results if r.status == "SURVIVED")

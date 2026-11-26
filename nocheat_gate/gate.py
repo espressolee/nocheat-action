@@ -9,7 +9,8 @@ import time
 from .adapters.ts_js import TsRuntimeUnavailable, analyze_ts_js_diff
 from .concurrency_gate import ConcurrencyGateReport, run_concurrency_pct_gate
 from .contracts import ContractReport, check_contracts, resolve_revisions
-from .diff_scope import DiffScope, extract_diff_scope, git_show_file
+from .diff_scope import DiffScope, GitInputError, extract_diff_scope, git_show_file
+from .impact import source_module_collisions
 from .mutator import (
     LiteralGuardHit,
     MutantCandidate,
@@ -19,6 +20,7 @@ from .mutator import (
 )
 from .runner import (
     MutantBatteryReport,
+    PytestDiscoveryError,
     _build_env,
     check_docstring_contracts,
     check_in_process_idempotence,
@@ -26,6 +28,7 @@ from .runner import (
     run_test_command,
     select_test_runner,
     temporary_checkout,
+    temporary_snapshot,
 )
 from .tier0_syntax import (
     Tier0Finding,
@@ -33,6 +36,20 @@ from .tier0_syntax import (
     analyze_python_test_diff,
     is_test_suite_degraded,
 )
+
+
+@dataclass(frozen=True)
+class SurvivingMutant:
+    rel_path: str
+    lineno: int | None
+    description: str
+    diff_line: tuple[str, str] | None
+
+
+@dataclass(frozen=True)
+class ProbeExecution:
+    status: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -60,6 +77,13 @@ class GateResult:
     weak_contracts: tuple[str, ...] = ()
     conflict_diagnostics: tuple[dict, ...] = ()
     baseline_execution: dict | None = None
+    surviving_mutant_details: tuple[SurvivingMutant, ...] = ()
+    idempotence_execution: ProbeExecution = ProbeExecution('SKIPPED', 'BASELINE_DID_NOT_PASS')
+    concurrency_execution: ProbeExecution = ProbeExecution('SKIPPED', 'BASELINE_DID_NOT_PASS')
+    mutant_runner_unavailable: int = 0
+    mutant_timeout_kills: int = 0
+    mutant_budget_unscored: int = 0
+    mutant_unknown_timeouts: int = 0
 
 
 def _collect_mutants_and_guards(
@@ -95,13 +119,26 @@ def _collect_mutants_and_guards(
     return cap_mutants_round_robin(raw_mutants, max_mutants=max_mutants), literal_guards
 
 
+def _mutation_incompleteness(battery: MutantBatteryReport) -> list[str]:
+    reasons = []
+    if battery.unavailable_mutants:
+        reasons.append(f'MUTANT_RUNNER_UNAVAILABLE: {battery.unavailable_mutants}/{battery.total_mutants}')
+    if battery.unknown_timeout_mutants:
+        reasons.append('MUTANT_TIMEOUT_CAUSE_UNKNOWN')
+    if battery.budget_exhausted:
+        reasons.append('PR_BUDGET_EXHAUSTED_120S')
+    return reasons
+
+
 def _evaluate_battery_verdict(
     battery: MutantBatteryReport,
     *,
     min_kill_rate: float,
 ) -> tuple[str | None, list[str]]:
     """Determine if mutation survival triggers BLOCK or timeout ABSTAIN."""
-    reasons: list[str] = []
+    reasons = _mutation_incompleteness(battery)
+    if battery.unavailable_mutants:
+        return 'ABSTAIN', reasons
     zero_kill_scopes = [
         f"{p}:{s}"
         for (p, s), (killed, run_n) in battery.per_scope_stats.items()
@@ -116,7 +153,6 @@ def _evaluate_battery_verdict(
             reasons.append(f"ZERO_KILL_SCOPES: {', '.join(zero_kill_scopes[:5])}")
         return "BLOCK", reasons
     if battery.budget_exhausted:
-        reasons.append("PR_BUDGET_EXHAUSTED_120S")
         return "ABSTAIN", reasons
     if battery.run_mutants == 0:
         reasons.append("ZERO_MUTABLE_AST_NODES")
@@ -130,7 +166,9 @@ def _evaluate_calibrated_gate_mutation(
     test_degraded: bool,
 ) -> tuple[str | None, list[str]]:
     """Calibrated v0.2 severity band separating severe fake-pass collapse from noisy partial coverage."""
-    reasons: list[str] = []
+    reasons = _mutation_incompleteness(battery)
+    if battery.unavailable_mutants:
+        return 'ABSTAIN', reasons
     zero_kill_scopes = [
         f"{p}:{s}"
         for (p, s), (killed, run_n) in battery.per_scope_stats.items()
@@ -158,7 +196,6 @@ def _evaluate_calibrated_gate_mutation(
             )
             return "ABSTAIN", reasons
     if battery.budget_exhausted:
-        reasons.append("PR_BUDGET_EXHAUSTED_120S")
         return "ABSTAIN", reasons
     if battery.run_mutants == 0:
         if test_degraded:
@@ -179,6 +216,7 @@ def _evaluate_pr_pair(
     per_mutant_timeout_s: float = 5.0,
     baseline_timeout_s: float | None = None,
     total_budget_s: float = 120.0,
+    test_cmd: tuple[str, ...] | None = None,
 ) -> tuple[GateResult, GateResult]:
     """Run BOTH Arm 3 (`MutationOnly`) and Arm 4 (`NoCheatGate`) on one commit pair.
 
@@ -187,14 +225,16 @@ def _evaluate_pr_pair(
     independent verdict rules for each arm.
     """
     t0 = time.monotonic()
-    scope = extract_diff_scope(repo_dir, base_ref, head_ref)
     try:
+        scope = extract_diff_scope(repo_dir, base_ref, head_ref)
         ts_res = analyze_ts_js_diff(repo_dir, base_ref, head_ref, scope.prod_files, scope.test_files)
-    except TsRuntimeUnavailable as exc:
+    except (GitInputError, TsRuntimeUnavailable) as exc:
+        skipped = ProbeExecution('SKIPPED', str(exc).split(':', 1)[0])
         common = dict(verdict='ABSTAIN', reasons=(str(exc),), total_mutants=0, run_mutants=0,
                       killed_mutants=0, survived_mutants=0, kill_rate=0.0, idempotent=True,
                       literal_guards=(), tier0_findings=(), runner_mode='unavailable', targets=(),
-                      elapsed_s=time.monotonic() - t0)
+                      elapsed_s=time.monotonic() - t0, idempotence_execution=skipped,
+                      concurrency_execution=skipped)
         return GateResult(arm='MutationOnly', **common), GateResult(arm='NoCheatGate', **common)
     mutants, literal_guards = _collect_mutants_and_guards(
         repo_dir,
@@ -214,19 +254,36 @@ def _evaluate_pr_pair(
     )
     combined_prod_scopes = scope.prod_scopes + ts_res.prod_scopes
     combined_fallback_scopes = scope.callee_fallback_scopes + ts_res.callee_fallback_scopes
+    if not scope.issues and not any(f.rel_path.endswith('.py') for f in (*scope.prod_files, *scope.test_files)):
+        test_cmd = None
 
     with temporary_checkout(repo_dir, head_ref) as worktree:
-        runner_mode, targets = select_test_runner(
-            worktree,
-            scope.test_files,
-            scope.prod_files,
-            combined_prod_scopes or combined_fallback_scopes,
+        no_target_reasons = ('NO_TEST_TARGETS_SELECTED',)
+        source_issues = scope.issues + source_module_collisions(
+            worktree, (item.rel_path for item in (*scope.prod_files, *scope.callee_fallback_scopes)),
         )
-        if not targets:
+        if source_issues:
+            runner_mode, targets = ('custom' if test_cmd is not None else 'pytest'), []
+            no_target_reasons = source_issues
+        elif test_cmd is not None:
+            runner_mode, targets = 'custom', []
+        else:
+            try:
+                runner_mode, targets = select_test_runner(
+                    worktree, scope.test_files, scope.prod_files,
+                    combined_prod_scopes or combined_fallback_scopes,
+                    pytest_python_files=scope.pytest_python_files,
+                    pytest_testpaths=scope.pytest_testpaths,
+                )
+            except PytestDiscoveryError as exc:
+                runner_mode, targets = 'pytest', []
+                no_target_reasons = (str(exc),)
+        if not targets and (test_cmd is None or source_issues):
             elapsed = time.monotonic() - t0
             has_executable_diff = bool(
                 scope.prod_files
                 or scope.test_files
+                or source_issues
                 or mutants
                 or tier0_findings
                 or literal_guards
@@ -246,6 +303,8 @@ def _evaluate_pr_pair(
                     runner_mode=runner_mode,
                     targets=(),
                     elapsed_s=elapsed,
+                    idempotence_execution=ProbeExecution('SKIPPED', 'NO_EXECUTABLE_SOURCE_CHANGES'),
+                    concurrency_execution=ProbeExecution('SKIPPED', 'NO_EXECUTABLE_SOURCE_CHANGES'),
                 )
                 return (
                     GateResult(arm="MutationOnly", **na_common),
@@ -254,7 +313,7 @@ def _evaluate_pr_pair(
             base_fail_3 = GateResult(
                 arm="MutationOnly",
                 verdict="ABSTAIN",
-                reasons=("NO_TEST_TARGETS_SELECTED",),
+                reasons=no_target_reasons,
                 total_mutants=len(mutants),
                 run_mutants=0,
                 killed_mutants=0,
@@ -266,11 +325,15 @@ def _evaluate_pr_pair(
                 runner_mode=runner_mode,
                 targets=(),
                 elapsed_s=elapsed,
+                idempotence_execution=ProbeExecution('SKIPPED', no_target_reasons[0].split(':', 1)[0]),
+                concurrency_execution=ProbeExecution('SKIPPED', no_target_reasons[0].split(':', 1)[0]),
             )
             # Tier 0 block (e.g. entire test file deleted!) still fires in Arm 4
             t0_blocks = [f for f in tier0_findings if f.severity == "block"]
             arm4_verdict = "BLOCK" if t0_blocks else "ABSTAIN"
-            arm4_reasons = tuple(f.message for f in t0_blocks) if t0_blocks else ("NO_TEST_TARGETS_SELECTED",)
+            arm4_reasons = tuple(f.message for f in t0_blocks) + (
+                no_target_reasons if not t0_blocks or no_target_reasons != ('NO_TEST_TARGETS_SELECTED',) else ()
+            )
             arm4 = GateResult(
                 arm="NoCheatGate",
                 verdict=arm4_verdict,
@@ -286,6 +349,8 @@ def _evaluate_pr_pair(
                 runner_mode=runner_mode,
                 targets=(),
                 elapsed_s=elapsed,
+                idempotence_execution=ProbeExecution('SKIPPED', no_target_reasons[0].split(':', 1)[0]),
+                concurrency_execution=ProbeExecution('SKIPPED', no_target_reasons[0].split(':', 1)[0]),
             )
             return base_fail_3, arm4
 
@@ -294,9 +359,10 @@ def _evaluate_pr_pair(
             if baseline_timeout_s is not None and baseline_timeout_s > 0
             else max(10.0, per_mutant_timeout_s * 3)
         )
-        baseline = run_test_command(
-            worktree, runner_mode, targets, timeout_s=effective_baseline_timeout
-        )
+        with temporary_snapshot(worktree) as baseline_tree:
+            baseline = run_test_command(
+                baseline_tree, runner_mode, targets, timeout_s=effective_baseline_timeout, test_cmd=test_cmd
+            )
         if not baseline.passed:
             elapsed = time.monotonic() - t0
             msg = (f"BASELINE_TESTS_FAILED: rc={baseline.returncode} {baseline.output_tail[:200]}",)
@@ -337,24 +403,18 @@ def _evaluate_pr_pair(
                 ),
             )
 
-        idempotent, idemp_msg = check_in_process_idempotence(
-            worktree, runner_mode, targets, timeout_s=max(10.0, baseline.elapsed_s * 4 + 2.0)
-        )
         py_prod_scopes = tuple(s for s in scope.prod_scopes if s.rel_path.endswith(".py"))
-        doctest_ok, doctest_msg = check_docstring_contracts(
-            worktree, py_prod_scopes, timeout_s=4.0
-        )
-        conc_report: ConcurrencyGateReport = run_concurrency_pct_gate(
-            worktree,
-            repo_dir,
-            head_ref,
-            py_prod_scopes or tuple(s for s in scope.callee_fallback_scopes if s.rel_path.endswith(".py")),
-            scope.prod_files,
-            runner_mode,
-            targets,
-            test_files=scope.test_files,
-            env=_build_env(worktree),
-        )
+        with temporary_snapshot(worktree) as probe_tree:
+            idempotent, idemp_msg = check_in_process_idempotence(
+                probe_tree, runner_mode, targets, timeout_s=max(10.0, baseline.elapsed_s * 4 + 2.0)
+            )
+            doctest_ok, doctest_msg = check_docstring_contracts(probe_tree, py_prod_scopes, timeout_s=4.0)
+            conc_report: ConcurrencyGateReport = run_concurrency_pct_gate(
+                probe_tree, repo_dir, head_ref,
+                py_prod_scopes or tuple(s for s in scope.callee_fallback_scopes if s.rel_path.endswith('.py')),
+                scope.prod_files, runner_mode, targets,
+                test_files=scope.test_files, env=_build_env(probe_tree),
+            )
         if runner_mode in {"vitest", "jest", "node_test"}:
             active_mutants = [m for m in mutants if not m.rel_path.endswith(".py")]
         else:
@@ -367,9 +427,35 @@ def _evaluate_pr_pair(
             per_mutant_timeout_s=max(per_mutant_timeout_s, baseline.elapsed_s * 3 + 2.0),
             total_budget_s=total_budget_s,
             started_at=t0,
+            test_cmd=test_cmd,
         )
 
     total_elapsed = time.monotonic() - t0
+    if idemp_msg in {'CUSTOM_TEST_COMMAND', 'IDEMPOTENCE_SKIPPED_OR_SCRIPT_ONLY'}:
+        idempotence_execution = ProbeExecution('SKIPPED', idemp_msg)
+    elif idemp_msg in {'IDEMPOTENCE_TIMEOUT_INCONCLUSIVE', 'IDEMPOTENCE_LAUNCH_UNAVAILABLE'}:
+        idempotence_execution = ProbeExecution('INCONCLUSIVE', idemp_msg)
+    else:
+        idempotence_execution = ProbeExecution('PASSED' if idempotent else 'FAILED', idemp_msg)
+    if conc_report.skip_reason:
+        concurrency_execution = ProbeExecution('SKIPPED', conc_report.skip_reason)
+    elif not conc_report.schedules_run:
+        concurrency_execution = ProbeExecution('INCONCLUSIVE', 'NO_CONCURRENCY_SCHEDULE_EXECUTED')
+    else:
+        concurrency_execution = ProbeExecution(
+            {'PASS': 'PASSED', 'ABSTAIN': 'INCONCLUSIVE', 'BLOCK': 'FAILED'}[conc_report.verdict],
+            next(iter(conc_report.reasons), 'CONCURRENCY_SCHEDULES_OBSERVED'),
+        )
+    mutation_execution = {
+        'mutant_runner_unavailable': battery.unavailable_mutants,
+        'mutant_timeout_kills': sum(result.status == 'KILLED_TIMEOUT' for result in battery.results),
+        'mutant_budget_unscored': battery.budget_unscored_mutants,
+        'mutant_unknown_timeouts': battery.unknown_timeout_mutants,
+    }
+    survivors = tuple(
+        SurvivingMutant(m.rel_path, m.lineno if m.lineno and m.lineno > 0 else None, m.desc, m.diff_line)
+        for m in (result.mutant for result in battery.results if result.status == 'SURVIVED')
+    )
     mut_verdict, mut_reasons = _evaluate_battery_verdict(
         battery, min_kill_rate=min_kill_rate
     )
@@ -392,6 +478,8 @@ def _evaluate_pr_pair(
         runner_mode=runner_mode,
         targets=tuple(targets),
         elapsed_s=total_elapsed,
+        surviving_mutant_details=survivors,
+        **mutation_execution,
     )
 
     # --- Arm 4: Full 3-Way NoCheat Merge Gate (v0.3 + PCT Concurrency + TS/JS) ---
@@ -457,6 +545,10 @@ def _evaluate_pr_pair(
         concurrency_mode=conc_report.mode,
         concurrency_verdict=conc_report.verdict,
         concurrency_reasons=conc_report.reasons,
+        surviving_mutant_details=survivors,
+        idempotence_execution=idempotence_execution,
+        concurrency_execution=concurrency_execution,
+        **mutation_execution,
     )
     return arm3, arm4
 
@@ -473,6 +565,7 @@ def evaluate_pr_pair(
     total_budget_s: float = 120.0,
     native_pythons: dict | None = None,
     requirement_policy: dict | None = None,
+    test_cmd: tuple[str, ...] | None = None,
 ) -> tuple[GateResult, GateResult]:
     """Add optional base-tree contract evidence without changing mutation thresholds.
 
@@ -493,6 +586,7 @@ def evaluate_pr_pair(
         repo_dir, base_ref, head_ref, min_kill_rate=min_kill_rate,
         max_mutants=max_mutants, per_mutant_timeout_s=per_mutant_timeout_s,
         baseline_timeout_s=baseline_timeout_s,
+        test_cmd=test_cmd,
         total_budget_s=max(0.0, total_budget_s - (time.monotonic() - started)),
     )
     verdict = arm4.verdict

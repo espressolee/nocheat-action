@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from itertools import zip_longest
 import copy
 from collections import defaultdict
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ class MutantCandidate:
     lineno: int
     desc: str
     mutated_source: str
+    diff_line: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,17 @@ def _is_docstring_expr(parent: ast.AST | None, field_name: str, idx: int | None,
     )
 
 
+def _diff_snippet(before: str, after: str) -> tuple[str, str]:
+    before, after = before.strip(), after.strip()
+    first_change = next((index for index, chars in enumerate(zip(before, after))
+                         if chars[0] != chars[1]), min(len(before), len(after)))
+    start = max(0, first_change - 50)
+    return tuple(
+        ('…' if start else '') + line[start:start + 100] + ('…' if len(line) > start + 100 else '')
+        for line in (before, after)
+    )
+
+
 def generate_diff_mutants(
     rel_path: str,
     source: str,
@@ -102,6 +115,7 @@ def generate_diff_mutants(
         return []
 
     canonical = ast.unparse(orig_tree)
+    canonical_lines = canonical.split('\n')
     diff_lines = scope.diff_lines
     specs: list[tuple[int, str, Callable[[ast.AST], None]]] = []
 
@@ -293,6 +307,14 @@ def generate_diff_mutants(
         if mutated_src in seen_sources:
             continue
         seen_sources.add(mutated_src)
+        diff_line = next(
+            (
+                _diff_snippet(before, after)
+                for before, after in zip_longest(canonical_lines, mutated_src.split('\n'), fillvalue='')
+                if before != after
+            ),
+            None,
+        )
         out.append(
             MutantCandidate(
                 rel_path=rel_path,
@@ -300,6 +322,7 @@ def generate_diff_mutants(
                 lineno=lineno,
                 desc=desc,
                 mutated_source=mutated_src,
+                diff_line=diff_line,
             )
         )
     return out
