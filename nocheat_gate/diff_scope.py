@@ -655,9 +655,64 @@ def _file_diff(
     return FileDiffSummary(path, change.status, added, removed, has_deletions, change.old_rel_path), source
 
 
-def extract_diff_scope(repo_dir: Path, base_ref: str, head_ref: str) -> DiffScope:
+def _path_matches_glob(rel_path: str, pattern: str) -> bool:
+    """Match a POSIX repo-relative path against a monorepo include/exclude glob."""
+    norm = pattern.strip().lstrip("./")
+    if not norm:
+        return False
+    if norm.endswith("/**"):
+        prefix = norm[:-3].rstrip("/")
+        return rel_path == prefix or rel_path.startswith(prefix + "/")
+    if norm.endswith("/"):
+        prefix = norm.rstrip("/")
+        return rel_path.startswith(prefix + "/")
+    if "/" not in norm:
+        return fnmatchcase(PurePosixPath(rel_path).name, norm) or fnmatchcase(rel_path, norm)
+    if fnmatchcase(rel_path, norm):
+        return True
+    if "**" in norm:
+        return PurePosixPath(rel_path).match(norm)
+    return False
+
+
+def _filter_path_changes(
+    changes: tuple[GitPathChange, ...],
+    include_paths: tuple[str, ...] = (),
+    exclude_paths: tuple[str, ...] = (),
+) -> tuple[GitPathChange, ...]:
+    """Filter git path changes by optional monorepo include/exclude globs."""
+    if not include_paths and not exclude_paths:
+        return changes
+    filtered: list[GitPathChange] = []
+    for ch in changes:
+        candidates = (ch.rel_path, ch.old_rel_path) if ch.old_rel_path else (ch.rel_path,)
+        if include_paths and not any(
+            _path_matches_glob(cand, pat) for cand in candidates for pat in include_paths
+        ):
+            continue
+        if exclude_paths and all(
+            any(_path_matches_glob(cand, pat) for pat in exclude_paths)
+            for cand in candidates
+        ):
+            continue
+        filtered.append(ch)
+    return tuple(filtered)
+
+
+def extract_diff_scope(
+    repo_dir: Path,
+    base_ref: str,
+    head_ref: str,
+    *,
+    include_paths: tuple[str, ...] = (),
+    exclude_paths: tuple[str, ...] = (),
+) -> DiffScope:
     """Extract production and test diff slices from `base_ref..head_ref`."""
-    changes = git_path_changes(repo_dir, base_ref, head_ref)
+    changes = _filter_path_changes(
+        git_path_changes(repo_dir, base_ref, head_ref),
+        include_paths=include_paths,
+        exclude_paths=exclude_paths,
+    )
     prod_files: list[FileDiffSummary] = []
     test_files: list[FileDiffSummary] = []
     collection = _pytest_collection(repo_dir, base_ref)

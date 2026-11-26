@@ -6,17 +6,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import time
 
-from .adapters.ts_js import TsRuntimeUnavailable, analyze_ts_js_diff
+from .adapters.base import OracleRegistry
+from .adapters.python_oracle import default_oracle_registry
+from .adapters.ts_js import TsRuntimeUnavailable
 from .concurrency_gate import ConcurrencyGateReport, run_concurrency_pct_gate
 from .contracts import ContractReport, check_contracts, resolve_revisions
-from .diff_scope import DiffScope, GitInputError, extract_diff_scope, git_show_file
+from .diff_scope import DiffScope, GitInputError, extract_diff_scope
 from .impact import source_module_collisions
 from .mutator import (
     LiteralGuardHit,
     MutantCandidate,
     cap_mutants_round_robin,
-    detect_single_literal_guards,
-    generate_diff_mutants,
 )
 from .runner import (
     MutantBatteryReport,
@@ -30,12 +30,7 @@ from .runner import (
     temporary_checkout,
     temporary_snapshot,
 )
-from .tier0_syntax import (
-    Tier0Finding,
-    analyze_python_prod_doctests,
-    analyze_python_test_diff,
-    is_test_suite_degraded,
-)
+from .tier0_syntax import Tier0Finding
 
 
 @dataclass(frozen=True)
@@ -84,39 +79,6 @@ class GateResult:
     mutant_timeout_kills: int = 0
     mutant_budget_unscored: int = 0
     mutant_unknown_timeouts: int = 0
-
-
-def _collect_mutants_and_guards(
-    repo_dir: Path,
-    scope: DiffScope,
-    *,
-    extra_mutants: tuple[MutantCandidate, ...] = (),
-    extra_guards: tuple[LiteralGuardHit, ...] = (),
-    max_mutants: int,
-) -> tuple[list[MutantCandidate], list[LiteralGuardHit]]:
-    target_scopes = scope.prod_scopes if scope.prod_scopes else scope.callee_fallback_scopes
-    raw_mutants: list[MutantCandidate] = list(extra_mutants)
-    literal_guards: list[LiteralGuardHit] = list(extra_guards)
-    cached_src: dict[str, str] = {}
-
-    for sc in target_scopes:
-        if not sc.rel_path.endswith(".py"):
-            continue
-        if sc.rel_path not in cached_src:
-            src = git_show_file(repo_dir, scope.head_ref, sc.rel_path)
-            if src is None:
-                continue
-            cached_src[sc.rel_path] = src
-        raw_mutants.extend(generate_diff_mutants(sc.rel_path, cached_src[sc.rel_path], sc))
-
-    for pf in scope.prod_files:
-        if pf.status == "D" or not pf.added_lines or not pf.rel_path.endswith(".py"):
-            continue
-        src = cached_src.get(pf.rel_path) or git_show_file(repo_dir, scope.head_ref, pf.rel_path)
-        if src:
-            literal_guards.extend(detect_single_literal_guards(pf.rel_path, src, pf.added_lines))
-
-    return cap_mutants_round_robin(raw_mutants, max_mutants=max_mutants), literal_guards
 
 
 def _mutation_incompleteness(battery: MutantBatteryReport) -> list[str]:
@@ -217,6 +179,9 @@ def _evaluate_pr_pair(
     baseline_timeout_s: float | None = None,
     total_budget_s: float = 120.0,
     test_cmd: tuple[str, ...] | None = None,
+    include_paths: tuple[str, ...] = (),
+    exclude_paths: tuple[str, ...] = (),
+    oracle_registry: OracleRegistry | None = None,
 ) -> tuple[GateResult, GateResult]:
     """Run BOTH Arm 3 (`MutationOnly`) and Arm 4 (`NoCheatGate`) on one commit pair.
 
@@ -225,9 +190,16 @@ def _evaluate_pr_pair(
     independent verdict rules for each arm.
     """
     t0 = time.monotonic()
+    registry = oracle_registry or default_oracle_registry()
     try:
-        scope = extract_diff_scope(repo_dir, base_ref, head_ref)
-        ts_res = analyze_ts_js_diff(repo_dir, base_ref, head_ref, scope.prod_files, scope.test_files)
+        scope = extract_diff_scope(
+            repo_dir,
+            base_ref,
+            head_ref,
+            include_paths=include_paths,
+            exclude_paths=exclude_paths,
+        )
+        oracle_results = registry.analyze_all(repo_dir, base_ref, head_ref, scope)
     except (GitInputError, TsRuntimeUnavailable) as exc:
         skipped = ProbeExecution('SKIPPED', str(exc).split(':', 1)[0])
         common = dict(verdict='ABSTAIN', reasons=(str(exc),), total_mutants=0, run_mutants=0,
@@ -236,24 +208,26 @@ def _evaluate_pr_pair(
                       elapsed_s=time.monotonic() - t0, idempotence_execution=skipped,
                       concurrency_execution=skipped)
         return GateResult(arm='MutationOnly', **common), GateResult(arm='NoCheatGate', **common)
-    mutants, literal_guards = _collect_mutants_and_guards(
-        repo_dir,
-        scope,
-        extra_mutants=ts_res.mutants,
-        extra_guards=ts_res.literal_guards,
-        max_mutants=max_mutants,
-    )
-    tier0_findings = (
-        analyze_python_test_diff(repo_dir, base_ref, head_ref, scope.test_files)
-        + analyze_python_prod_doctests(repo_dir, base_ref, head_ref, scope.prod_files)
-        + ts_res.tier0_findings
-    )
-    test_degraded = (
-        is_test_suite_degraded(repo_dir, base_ref, head_ref, scope.test_files)
-        or ts_res.test_degraded
-    )
-    combined_prod_scopes = scope.prod_scopes + ts_res.prod_scopes
-    combined_fallback_scopes = scope.callee_fallback_scopes + ts_res.callee_fallback_scopes
+
+    raw_mutants: list[MutantCandidate] = []
+    literal_guards: list[LiteralGuardHit] = []
+    tier0_list: list[Tier0Finding] = []
+    combined_prod_scopes_list = []
+    combined_fallback_scopes_list = []
+    test_degraded = False
+
+    for res in oracle_results:
+        raw_mutants.extend(res.mutants)
+        literal_guards.extend(res.literal_guards)
+        tier0_list.extend(res.tier0_findings)
+        combined_prod_scopes_list.extend(res.prod_scopes)
+        combined_fallback_scopes_list.extend(res.callee_fallback_scopes)
+        test_degraded = test_degraded or res.test_degraded
+
+    mutants = cap_mutants_round_robin(raw_mutants, max_mutants=max_mutants)
+    tier0_findings = tuple(tier0_list)
+    combined_prod_scopes = tuple(combined_prod_scopes_list) or scope.prod_scopes
+    combined_fallback_scopes = tuple(combined_fallback_scopes_list) or scope.callee_fallback_scopes
     if not scope.issues and not any(f.rel_path.endswith('.py') for f in (*scope.prod_files, *scope.test_files)):
         test_cmd = None
 
@@ -566,6 +540,9 @@ def evaluate_pr_pair(
     native_pythons: dict | None = None,
     requirement_policy: dict | None = None,
     test_cmd: tuple[str, ...] | None = None,
+    include_paths: tuple[str, ...] = (),
+    exclude_paths: tuple[str, ...] = (),
+    oracle_registry: OracleRegistry | None = None,
 ) -> tuple[GateResult, GateResult]:
     """Add optional base-tree contract evidence without changing mutation thresholds.
 
@@ -587,6 +564,9 @@ def evaluate_pr_pair(
         max_mutants=max_mutants, per_mutant_timeout_s=per_mutant_timeout_s,
         baseline_timeout_s=baseline_timeout_s,
         test_cmd=test_cmd,
+        include_paths=include_paths,
+        exclude_paths=exclude_paths,
+        oracle_registry=oracle_registry,
         total_budget_s=max(0.0, total_budget_s - (time.monotonic() - started)),
     )
     verdict = arm4.verdict

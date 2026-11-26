@@ -219,6 +219,18 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         '--test-cmd',
         help='Explicit test command for Python changes, split into argv without a shell',
     )
+    parser.add_argument(
+        '--include',
+        action='append',
+        default=[],
+        help='Repeatable glob pattern restricting evaluation to matching repo-relative paths',
+    )
+    parser.add_argument(
+        '--exclude',
+        action='append',
+        default=[],
+        help='Repeatable glob pattern excluding matching repo-relative paths from evaluation',
+    )
 
     args = parser.parse_args(argv)
     if args.baseline_timeout is not None and args.baseline_timeout <= 0:
@@ -244,6 +256,8 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         **({"baseline_timeout_s": args.baseline_timeout} if args.baseline_timeout is not None else {}),
         **({"native_pythons": native_pythons} if native_pythons is not None else {}),
         **({'test_cmd': test_cmd} if test_cmd is not None else {}),
+        **({'include_paths': tuple(args.include)} if args.include else {}),
+        **({'exclude_paths': tuple(args.exclude)} if args.exclude else {}),
     )
 
     if args.json:

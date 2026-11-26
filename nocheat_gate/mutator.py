@@ -227,7 +227,11 @@ def generate_diff_mutants(
                     specs.append((lineno, f"line {lineno}: Return -> None", _mut_ret_none))
 
             elif isinstance(node, ast.ExceptHandler) and node.body:
-                if not all(isinstance(s, ast.Raise) for s in node.body):
+                body_touched = any(getattr(s, "lineno", 0) in diff_lines for s in node.body)
+                is_broad_handler = node.type is None or (
+                    isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}
+                )
+                if (body_touched or is_broad_handler) and not all(isinstance(s, ast.Raise) for s in node.body):
 
                     def _mut_except(root: ast.AST, p: tuple[_AstPathStep, ...] = path) -> None:
                         tgt = _get_node_at_path(root, p)

@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def test_package_has_no_research_or_third_party_imports():
     """Verify the extracted slice stays strictly self-contained and zero-dependency."""
     stdlib = set(sys.stdlib_module_names)
-    local_mods = {p.stem for p in PKG_ROOT.glob("*.py")} | {"adapters", "nocheat_gate"}
+    local_mods = {p.stem for p in PKG_ROOT.rglob("*.py")} | {"adapters", "nocheat_gate"}
     forbidden_research = {
         "selection",
         "c3_prospective_rule",
@@ -1536,3 +1536,135 @@ def test_baseline_timeout_override_controls_slow_fixture_startup(tmp_path: Path)
         ]
     )
     assert rc_relaxed == 0  # PASS
+
+
+def test_monorepo_include_and_exclude_path_filters(tmp_path: Path):
+    repo = tmp_path / "monorepo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "pkg_a").mkdir()
+    (repo / "pkg_b").mkdir()
+    (repo / "tests").mkdir()
+    (repo / "pkg_a" / "calc.py").write_text("def add(x, y):\n    return x + y\n", encoding="utf-8")
+    (repo / "pkg_b" / "calc.py").write_text("def sub(x, y):\n    return x - y\n", encoding="utf-8")
+    (repo / "tests" / "test_pkg_a.py").write_text(
+        "from pkg_a.calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "init monorepo")
+
+    _git(repo, "checkout", "-b", "feat-both")
+    (repo / "pkg_a" / "calc.py").write_text("def add(x, y):\n    return x + y + 0\n", encoding="utf-8")
+    (repo / "pkg_b" / "calc.py").write_text("def sub(x, y):\n    return x - y - 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "touch both packages")
+
+    scope_a = extract_diff_scope(repo, "main", "HEAD", include_paths=("pkg_a/**",))
+    assert [f.rel_path for f in scope_a.prod_files] == ["pkg_a/calc.py"]
+
+    scope_no_b = extract_diff_scope(repo, "main", "HEAD", exclude_paths=("pkg_b/**",))
+    assert [f.rel_path for f in scope_no_b.prod_files] == ["pkg_a/calc.py"]
+
+    scope_none = extract_diff_scope(repo, "main", "HEAD", exclude_paths=("pkg_a/**", "pkg_b/**"))
+    assert scope_none.prod_files == ()
+
+
+def test_language_oracle_protocol_and_registry_dispatch(tmp_path: Path):
+    from nocheat_gate.adapters import (
+        LanguageAnalysisResult,
+        LanguageOracle,
+        OracleRegistry,
+        PythonLanguageOracle,
+        default_oracle_registry,
+    )
+
+    py_oracle = PythonLanguageOracle()
+    assert isinstance(py_oracle, LanguageOracle)
+    assert py_oracle.matches_path("src/app.py")
+    assert not py_oracle.matches_path("src/app.ts")
+
+    reg = default_oracle_registry(load_plugins=False)
+    assert [o.language for o in reg.oracles] == ["python", "ts_js"]
+
+    called: list[str] = []
+
+    class DummyRustOracle:
+        language = "rust"
+        supported_extensions = (".rs",)
+
+        def matches_path(self, rel_path: str) -> bool:
+            return rel_path.endswith(".rs")
+
+        def analyze_diff(self, repo_dir, base_ref, head_ref, scope):
+            called.append(f"{base_ref}..{head_ref}")
+            return LanguageAnalysisResult(language="rust")
+
+    custom_reg = OracleRegistry((PythonLanguageOracle(), DummyRustOracle()))
+    assert isinstance(custom_reg.get("rust"), LanguageOracle)
+
+    repo = tmp_path / "oracle-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "billing.py").write_text("def charge(x):\n    return x * 2\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_billing.py").write_text(
+        "from billing import charge\n\ndef test_charge():\n    assert charge(3) == 6\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "init")
+    _git(repo, "checkout", "-b", "feat")
+    (repo / "billing.py").write_text("def charge(x):\n    return x * 3\n", encoding="utf-8")
+    (repo / "tests" / "test_billing.py").write_text(
+        "from billing import charge\n\ndef test_charge():\n    assert charge(3) == 9\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "update multiplier")
+
+    res = evaluate_nocheat_gate(repo, "main", "HEAD", oracle_registry=custom_reg)
+    assert res.verdict == "PASS"
+    assert called == []  # Rust oracle was NOT invoked on a Python-only diff
+
+
+def test_lib_layout_env_prepends_lib_source_root(tmp_path: Path):
+    # Reproduces PyYAML-style `lib/<pkg>/` layout so mutated snapshots shadow site-packages
+    (tmp_path / "lib" / "myyaml").mkdir(parents=True)
+    (tmp_path / "lib" / "myyaml" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    env = runner._build_env(tmp_path)
+    parts = env["PYTHONPATH"].split(os.pathsep)
+    assert str(tmp_path / "lib") in parts[:2]
+
+    # A real package named `lib` (with `lib/__init__.py`) must NOT be prepended as a source root
+    pkg_repo = tmp_path / "pkg_named_lib"
+    (pkg_repo / "lib").mkdir(parents=True)
+    (pkg_repo / "lib" / "__init__.py").write_text("", encoding="utf-8")
+    env2 = runner._build_env(pkg_repo)
+    assert str(pkg_repo / "lib") not in env2["PYTHONPATH"].split(os.pathsep)
+
+
+def test_narrowing_except_header_does_not_mutate_untouched_body():
+    from nocheat_gate.diff_scope import ChangedScope
+    from nocheat_gate.mutator import generate_diff_mutants
+
+    src_narrow = (
+        "def enable_vt(fd):\n"
+        "    try:\n"
+        "        return fd > 0\n"
+        "    except (OSError, TypeError):\n"
+        "        return False\n"
+    )
+    # Only line 4 (`except (OSError, TypeError):`) was edited; line 5 body is untouched
+    sc_narrow = ChangedScope("winterm.py", "enable_vt", 1, 5, frozenset({4}))
+    assert generate_diff_mutants("winterm.py", src_narrow, sc_narrow) == []
+
+    # Widening to `except Exception:` or editing the body MUST still generate `Except -> raise`
+    src_broad = src_narrow.replace("except (OSError, TypeError):", "except Exception:")
+    sc_broad = ChangedScope("winterm.py", "enable_vt", 1, 5, frozenset({4}))
+    muts_broad = generate_diff_mutants("winterm.py", src_broad, sc_broad)
+    assert any("Except -> raise" in m.desc for m in muts_broad)
+
+    sc_body = ChangedScope("winterm.py", "enable_vt", 1, 5, frozenset({4, 5}))
+    muts_body = generate_diff_mutants("winterm.py", src_narrow, sc_body)
+    assert any("Except -> raise" in m.desc for m in muts_body)

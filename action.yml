@@ -35,6 +35,14 @@ inputs:
     description: 'Optional test command for Python changes, parsed as arguments without a shell'
     required: false
     default: ''
+  include-paths:
+    description: 'Optional newline- or comma-separated glob filters to include only matching repo paths'
+    required: false
+    default: ''
+  exclude-paths:
+    description: 'Optional newline- or comma-separated glob filters to exclude matching repo paths'
+    required: false
+    default: ''
 
 branding:
   icon: 'shield'
@@ -55,6 +63,8 @@ runs:
         INPUT_JSON: ${{ inputs.json }}
         INPUT_BASELINE_TIMEOUT: ${{ inputs.baseline-timeout }}
         INPUT_TEST_CMD: ${{ inputs.test-cmd }}
+        INPUT_INCLUDE_PATHS: ${{ inputs.include-paths }}
+        INPUT_EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         PR_BASE_REF: ${{ github.base_ref }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -101,6 +111,18 @@ runs:
         fi
         if [ -n "${INPUT_TEST_CMD:-}" ]; then
           EXTRA_ARGS+=("--test-cmd=$INPUT_TEST_CMD")
+        fi
+        if [ -n "${INPUT_INCLUDE_PATHS:-}" ]; then
+          while IFS= read -r pat; do
+            pat="$(printf '%s' "$pat" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -n "$pat" ] && EXTRA_ARGS+=("--include=$pat")
+          done < <(printf '%s\n' "$INPUT_INCLUDE_PATHS" | tr ',' '\n')
+        fi
+        if [ -n "${INPUT_EXCLUDE_PATHS:-}" ]; then
+          while IFS= read -r pat; do
+            pat="$(printf '%s' "$pat" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -n "$pat" ] && EXTRA_ARGS+=("--exclude=$pat")
+          done < <(printf '%s\n' "$INPUT_EXCLUDE_PATHS" | tr ',' '\n')
         fi
 
         echo "::group::NoCheat Merge Gate ($TARGET_MODE mode: $TARGET_BASE..$TARGET_HEAD)"

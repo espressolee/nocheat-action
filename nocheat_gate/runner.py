@@ -316,9 +316,26 @@ def select_test_runner(
     return ("pytest" if has_py_changes or not (worktree / "package.json").exists() else "vitest"), []
 
 
+def _has_python_lib_root(worktree: Path) -> bool:
+    """Return True when `lib/` acts as a non-package Python source root (e.g. PyYAML)."""
+    lib_dir = worktree / "lib"
+    if not lib_dir.is_dir() or (lib_dir / "__init__.py").exists():
+        return False
+    try:
+        return any(
+            (child.is_dir() and (child / "__init__.py").is_file())
+            or (child.is_file() and child.suffix == ".py")
+            for child in lib_dir.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def _build_env(worktree: Path) -> dict[str, str]:
     env = os.environ.copy()
     py_paths = [str(worktree)]
+    if _has_python_lib_root(worktree):
+        py_paths.insert(0, str(worktree / "lib"))
     if (worktree / "src").is_dir():
         py_paths.insert(0, str(worktree / "src"))
     if env.get("PYTHONPATH"):
