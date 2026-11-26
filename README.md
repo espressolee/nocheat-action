@@ -12,7 +12,7 @@
 When the same family of LLMs writes code, fixes failing CI checks, reviews diffs, and evaluates approval policies, weak unit tests create **correlated failure**: an agent can weaken assertions or hardcode test-input shortcuts so standard CI turns green while real behavior breaks.
 
 **NoCheat Merge Gate** enforces a strict **Stochastic Proposer vs. Deterministic Verifier** boundary:
-- **Zero LLM calls, zero third-party Python runtime dependencies** (`Python 3.11–3.13`).
+- **Zero LLM calls, zero third-party Python runtime dependencies** (`Python 3.11–3.14`).
 - **4-state fail-closed verdicts (`PASS`, `ABSTAIN`, `BLOCK`, `BASELINE_FAIL`)** with clean separation of non-executable/non-mutable diffs (`NO_EXECUTABLE_SOURCE_CHANGES`, `NO_MUTABLE_LOGIC_DIFF`) so docs and clean test refactors do not spam senior reviewers.
 - **Anti-self-oracle rule:** optional `.nocheat-contracts.json` specifications are read strictly from the `base` commit; editing a contract in the same PR fails closed to `ABSTAIN`.
 
@@ -25,12 +25,12 @@ When the same family of LLMs writes code, fixes failing CI checks, reviews diffs
   with:
     fetch-depth: 0
 
-- uses: espressolee/nocheat-action@v0.1.0
+- uses: espressolee/nocheat-action@v0.1.1
   with:
     mode: observe   # report only (exit 0) and write findings to $GITHUB_STEP_SUMMARY
 ```
 
-Switch `mode: enforce` to hard-block merges (`exit 2`) only when a deterministic defect witness or test-integrity violation is confirmed (`ABSTAIN` remains `exit 0` for human review).
+Switch `mode: enforce` to hard-block merges (`exit 2`) only when a deterministic defect witness or test-integrity violation is confirmed (`ABSTAIN` remains `exit 0` for human review). For monorepos, pass `include-paths` / `exclude-paths` (or CLI `--include` / `--exclude`) globs.
 
 ### Local CLI Usage
 
