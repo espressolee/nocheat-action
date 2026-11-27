@@ -25,7 +25,7 @@ When the same family of LLMs writes code, fixes failing CI checks, reviews diffs
   with:
     fetch-depth: 0
 
-- uses: espressolee/nocheat-action@v0.1.2
+- uses: espressolee/nocheat-action@v0.1.3
   with:
     mode: observe   # report only (exit 0) and write findings to $GITHUB_STEP_SUMMARY
 ```
@@ -39,6 +39,8 @@ python3 -m pip install --no-deps .
 nocheat-gate --repo . --base main --head HEAD --mode observe --json
 # For slow DB/app test fixtures (>15s startup):
 nocheat-gate --repo . --base main --head HEAD --mode observe --baseline-timeout 45
+# Replay a deterministic concurrency race trace (nocheat.concurrency_trace.v1) saved from --json:
+nocheat-gate replay-concurrency --repo . --head HEAD --trace concurrency_trace.json --json
 ```
 
 For projects using pytest, NoCheat uses the base revision’s `python_files` and

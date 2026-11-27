@@ -49,6 +49,7 @@ class ConcurrencyGateReport:
     reasons: tuple[str, ...]
     elapsed_s: float
     skip_reason: str | None = None
+    schedule_trace: dict | None = None
 
 
 def _attr_root_name(node: ast.AST) -> str | None:
@@ -424,6 +425,11 @@ class _PctSelectorEventLoop(asyncio.SelectorEventLoop):
             task_handles,
             key=lambda item: self._pct_pool.ensure_prio(id(item[1])),
         )
+        tid = id(chosen_task)
+        slot = STATE.setdefault("async_slots", {}).setdefault(tid, len(STATE.setdefault("async_slots", {})))
+        ev_list = STATE.setdefault("schedule_events", [])
+        if len(ev_list) < 64:
+            ev_list.append(f"async:{slot}")
         deferred = [h for h in ready if h is not chosen_h]
         self._ready = collections.deque([chosen_h])
         try:
@@ -556,6 +562,10 @@ def _install_threading_pct(pct_pool: _PctPriorityPool):
                     break
                 sched_cond.wait(timeout=0.003)
             pct_pool.on_step_dispatched(me)
+            t_slot = STATE.setdefault("thread_slots", {}).setdefault(me, len(STATE.setdefault("thread_slots", {})))
+            ev_list = STATE.setdefault("schedule_events", [])
+            if len(ev_list) < 64:
+                ev_list.append(f"thread:{t_slot}")
             sched_cond.notify_all()
         return _trace
 
@@ -618,7 +628,7 @@ if STATE["deadlock_cycle"] and rc == 0:
 
 obs_steps = max(async_pool.step, thread_pool.step if thread_pool else 0)
 print(
-    f"__PCT_META__={json.dumps({'concurrent_observed': STATE['concurrent_observed'], 'observed_steps': obs_steps, 'rc': rc})}",
+    f"__PCT_META__={json.dumps({'concurrent_observed': STATE['concurrent_observed'], 'observed_steps': obs_steps, 'rc': rc, 'schedule_events': STATE.get('schedule_events', [])[:64]})}",
     flush=True,
 )
 sys.exit(rc)
@@ -638,7 +648,7 @@ def _run_one_pct_schedule(
     est_steps: int,
     timeout_s: float,
     env: dict[str, str],
-) -> tuple[str, bool, int, str]:
+) -> tuple[str, bool, int, str, list[str]]:
     payload = {
         "runner_mode": runner_mode,
         "targets": targets,
@@ -665,10 +675,12 @@ def _run_one_pct_schedule(
             False,
             est_steps,
             f"PCT_SCHEDULE_TIMEOUT_INCONCLUSIVE(mode={mode},d={bug_depth},seed={seed})",
+            [],
         )
 
     concurrent_obs = False
     obs_steps = est_steps
+    sched_events: list[str] = []
     for ln in reversed(proc.stdout.splitlines()):
         if ln.startswith("__PCT_META__="):
             try:
@@ -676,12 +688,15 @@ def _run_one_pct_schedule(
                 concurrent_obs = bool(meta.get("concurrent_observed", False))
                 if isinstance(meta.get("observed_steps"), int) and meta["observed_steps"] > 0:
                     obs_steps = meta["observed_steps"]
+                raw_ev = meta.get("schedule_events")
+                if isinstance(raw_ev, list):
+                    sched_events = [str(x) for x in raw_ev[:64]]
             except json.JSONDecodeError:
                 pass
             break
     status = "passed" if proc.returncode == 0 else "failed"
     detail = (proc.stderr or proc.stdout).strip()[-350:]
-    return status, concurrent_obs, obs_steps, detail
+    return status, concurrent_obs, obs_steps, detail, sched_events
 
 
 def run_concurrency_pct_gate(
@@ -741,11 +756,13 @@ def run_concurrency_pct_gate(
     concurrent_observed = False
     est_steps = 24
     timeout_reason: str | None = None
+    timeout_trace: dict | None = None
     for depth, seed, rev in schedule_plan:
         if time.monotonic() - t0 >= total_pct_budget_s:
             break
         runs += 1
-        status, conc_obs, obs_steps, detail = _run_one_pct_schedule(
+        used_est_steps = est_steps
+        status, conc_obs, obs_steps, detail, sched_events = _run_one_pct_schedule(
             worktree,
             runner_mode,
             targets,
@@ -754,7 +771,7 @@ def run_concurrency_pct_gate(
             bug_depth=depth,
             seed=seed,
             reverse_base=rev,
-            est_steps=est_steps,
+            est_steps=used_est_steps,
             timeout_s=per_schedule_timeout_s,
             env=env,
         )
@@ -762,6 +779,21 @@ def run_concurrency_pct_gate(
             est_steps = max(4, obs_steps)
         concurrent_observed = concurrent_observed or conc_obs
         if status == "failed":
+            trace_obj = {
+                "schema": "nocheat.concurrency_trace.v1",
+                "runner_mode": runner_mode,
+                "targets": list(targets),
+                "scope_rel_paths": list(analysis.target_rel_paths),
+                "mode": mode,
+                "bug_depth": depth,
+                "seed": seed,
+                "reverse_base": rev,
+                "est_steps": used_est_steps,
+                "outcome": "failed",
+                "concurrent_observed": concurrent_observed,
+                "observed_steps": obs_steps,
+                "schedule_events": sched_events[:64],
+            }
             return ConcurrencyGateReport(
                 triggered=True,
                 verdict="BLOCK",
@@ -777,9 +809,25 @@ def run_concurrency_pct_gate(
                     f"CONCURRENCY_RACE_WITNESS(mode={mode}, bug_depth={depth}, seed={seed}): {detail}",
                 ),
                 elapsed_s=time.monotonic() - t0,
+                schedule_trace=trace_obj,
             )
         if status == "timeout" and timeout_reason is None:
             timeout_reason = detail
+            timeout_trace = {
+                "schema": "nocheat.concurrency_trace.v1",
+                "runner_mode": runner_mode,
+                "targets": list(targets),
+                "scope_rel_paths": list(analysis.target_rel_paths),
+                "mode": mode,
+                "bug_depth": depth,
+                "seed": seed,
+                "reverse_base": rev,
+                "est_steps": used_est_steps,
+                "outcome": "timeout",
+                "concurrent_observed": concurrent_observed,
+                "observed_steps": obs_steps,
+                "schedule_events": sched_events[:64],
+            }
 
     if timeout_reason is not None:
         return ConcurrencyGateReport(
@@ -795,6 +843,7 @@ def run_concurrency_pct_gate(
             concurrent_observed=concurrent_observed,
             reasons=(timeout_reason,),
             elapsed_s=time.monotonic() - t0,
+            schedule_trace=timeout_trace,
         )
 
     if analysis.unguarded_shared_writes and not concurrent_observed:
@@ -830,3 +879,65 @@ def run_concurrency_pct_gate(
         reasons=(),
         elapsed_s=time.monotonic() - t0,
     )
+
+
+def replay_concurrency_trace(
+    repo_dir: Path,
+    head_ref: str,
+    trace: dict,
+    *,
+    timeout_s: float = 4.0,
+) -> dict:
+    """Deterministically replay a recorded `nocheat.concurrency_trace.v1` schedule in an isolated worktree."""
+    if not isinstance(trace, dict) or trace.get("schema") != "nocheat.concurrency_trace.v1":
+        raise ValueError("INVALID_CONCURRENCY_TRACE_SCHEMA")
+    from .runner import _build_env, temporary_checkout
+
+    runner_mode = str(trace.get("runner_mode") or "pytest")
+    targets = [str(t) for t in (trace.get("targets") or ())]
+    scope_rels = [str(p) for p in (trace.get("scope_rel_paths") or ())]
+    mode = str(trace.get("mode") or "threading")
+    bug_depth = int(trace.get("bug_depth", 1))
+    seed = int(trace.get("seed", 0))
+    reverse_base = bool(trace.get("reverse_base", False))
+    est_steps = max(4, int(trace.get("est_steps", 24)))
+    if not targets:
+        raise ValueError("CONCURRENCY_TRACE_MISSING_TARGETS")
+
+    with temporary_checkout(Path(repo_dir).resolve(), head_ref) as worktree:
+        scope_abs = [str((worktree / rp).resolve()) for rp in scope_rels] + [
+            str((worktree / t).resolve()) for t in targets
+        ]
+        status, conc_obs, obs_steps, detail, events = _run_one_pct_schedule(
+            worktree,
+            runner_mode,
+            targets,
+            scope_abs,
+            mode=mode,
+            bug_depth=bug_depth,
+            seed=seed,
+            reverse_base=reverse_base,
+            est_steps=est_steps,
+            timeout_s=timeout_s,
+            env=_build_env(worktree),
+        )
+    replay_status = (
+        "REPRODUCED"
+        if status == "failed"
+        else ("TIMEOUT" if status == "timeout" else "NOT_REPRODUCED")
+    )
+    return {
+        "schema": "nocheat.concurrency_replay.v1",
+        "trace_schema": trace["schema"],
+        "status": replay_status,
+        "outcome": status,
+        "mode": mode,
+        "bug_depth": bug_depth,
+        "seed": seed,
+        "reverse_base": reverse_base,
+        "est_steps": est_steps,
+        "concurrent_observed": conc_obs,
+        "observed_steps": obs_steps,
+        "schedule_events": events,
+        "detail": detail,
+    }

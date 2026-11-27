@@ -385,6 +385,8 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         return _contract_cli(argv[1:])
     if argv and argv[0] == 'explain':
         return _explain_cli(argv[1:])
+    if argv and argv[0] == 'replay-concurrency':
+        return _replay_concurrency_cli(argv[1:])
     if argv and argv[0] == 'check':
         argv = argv[1:]
 
@@ -501,6 +503,7 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
             "concurrency_mode": res.concurrency_mode,
             "concurrency_verdict": res.concurrency_verdict,
             "concurrency_reasons": list(res.concurrency_reasons),
+            "concurrency_trace": res.concurrency_trace,
             "total_mutants": res.total_mutants,
             "run_mutants": res.run_mutants,
             "killed_mutants": res.killed_mutants,
@@ -725,6 +728,42 @@ def _explain_cli(argv: list[str]) -> int:
         print(f'Unknown NoCheat reason code: {code}', file=sys.stderr)
         return 1
     print(f'[{code}] {msg}')
+    return 0
+
+
+def _replay_concurrency_cli(argv: list[str]) -> int:
+    from .concurrency_gate import replay_concurrency_trace
+
+    parser = argparse.ArgumentParser(
+        prog='nocheat-gate replay-concurrency',
+        description='Deterministically replay a recorded nocheat.concurrency_trace.v1 schedule.',
+    )
+    parser.add_argument('--repo', type=Path, default=Path('.'), help='Repository root')
+    parser.add_argument('--head', default='HEAD', help='Git revision to check out and replay')
+    parser.add_argument('--trace', required=True, type=Path, help='Path to trace JSON file (or gate --json output)')
+    parser.add_argument('--timeout', type=float, default=4.0, help='Per-schedule timeout in seconds')
+    parser.add_argument('--json', action='store_true', help='Emit machine-readable replay result JSON')
+    args = parser.parse_args(argv)
+
+    raw = json.loads(args.trace.read_text(encoding='utf-8'))
+    trace = raw.get('concurrency_trace') if isinstance(raw, dict) and 'concurrency_trace' in raw else raw
+    try:
+        res = replay_concurrency_trace(args.repo, args.head, trace, timeout_s=args.timeout)
+    except (ValueError, OSError) as exc:
+        print(f'[NoCheatGate] Replay error: {_single_line(str(exc))}', file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(
+            f"[NoCheatGate] replay-concurrency status={res['status']} "
+            f"(mode={res['mode']}, d={res['bug_depth']}, seed={res['seed']}, steps={res['observed_steps']})"
+        )
+    if res['status'] == 'REPRODUCED':
+        return 2
+    if res['status'] == 'TIMEOUT':
+        return 3
     return 0
 
 

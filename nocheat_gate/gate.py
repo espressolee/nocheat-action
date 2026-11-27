@@ -113,6 +113,7 @@ class GateResult:
     concurrency_mode: str = "none"
     concurrency_verdict: str = "PASS"
     concurrency_reasons: tuple[str, ...] = ()
+    concurrency_trace: dict | None = None
     contract_report: ContractReport | None = None
     weak_contracts: tuple[str, ...] = ()
     conflict_diagnostics: tuple[dict, ...] = ()
@@ -619,6 +620,7 @@ def _evaluate_pr_pair(
             concurrency_mode=conc_report.mode,
             concurrency_verdict=conc_report.verdict,
             concurrency_reasons=conc_report.reasons,
+            concurrency_trace=conc_report.schedule_trace,
             surviving_mutant_details=survivors,
             idempotence_execution=idempotence_execution,
             concurrency_execution=concurrency_execution,
@@ -672,6 +674,7 @@ def _evaluate_pr_pair(
             concurrency_mode=py_item.concurrency_mode if is_arm4 else "none",
             concurrency_verdict=py_item.concurrency_verdict if is_arm4 else "PASS",
             concurrency_reasons=py_item.concurrency_reasons if is_arm4 else (),
+            concurrency_trace=py_item.concurrency_trace if is_arm4 else None,
             baseline_execution=base_diag,
             surviving_mutant_details=all_survivors,
             idempotence_execution=py_item.idempotence_execution,

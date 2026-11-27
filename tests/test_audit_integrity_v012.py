@@ -153,3 +153,81 @@ def test_cli_abstain_policy_warn_vs_fail_exit_codes(tmp_path: Path):
         "--abstain-policy", "fail",
     ])
     assert rc_fail == 3
+
+
+def test_deterministic_concurrency_trace_and_replay_cli(tmp_path: Path, capsys):
+    import json
+    from nocheat_gate.concurrency_gate import replay_concurrency_trace
+    from nocheat_gate.gate import evaluate_nocheat_gate
+
+    repo = tmp_path / "async_race_repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.name", "Dev")
+    _git(repo, "config", "user.email", "dev@example.com")
+
+    (repo / "vault.py").write_text("BALANCE = 100\n", encoding="utf-8")
+    (repo / "test_vault.py").write_text("from vault import BALANCE\n\ndef test_init():\n    assert BALANCE == 100\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+
+    # Add an asyncio check-then-act race that passes default FIFO order (t1 completes before t2 checks? No:
+    # Make task 1 check+yield then withdraw, task 2 deposit or withdraw in reverse priority order so FIFO passes!)
+    _git(repo, "checkout", "-b", "race-pr")
+    (repo / "vault.py").write_text(
+        "import asyncio\n\n"
+        "class OrderState:\n"
+        "    def __init__(self):\n"
+        "        self.ready = False\n"
+        "        self.value = 0\n\n"
+        "    async def producer(self):\n"
+        "        self.ready = True\n"
+        "        await asyncio.sleep(0)\n"
+        "        self.value = 42\n\n"
+        "    async def consumer(self):\n"
+        "        await asyncio.sleep(0)\n"
+        "        if self.ready:\n"
+        "            return self.value\n"
+        "        return 0\n",
+        encoding="utf-8",
+    )
+    (repo / "test_vault.py").write_text(
+        "import asyncio\n"
+        "from vault import OrderState\n\n"
+        "def test_order_state():\n"
+        "    async def run():\n"
+        "        st = OrderState()\n"
+        "        _, got = await asyncio.gather(st.producer(), st.consumer())\n"
+        "        assert got == 42\n"
+        "    asyncio.run(run())\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: async producer/consumer with race")
+
+    res = evaluate_nocheat_gate(repo, "main", "HEAD")
+    assert res.verdict == "BLOCK", res.reasons
+    assert res.concurrency_verdict == "BLOCK"
+    assert res.concurrency_trace is not None
+    assert res.concurrency_trace["schema"] == "nocheat.concurrency_trace.v1"
+    assert res.concurrency_trace["mode"] == "asyncio"
+    assert len(res.concurrency_trace["schedule_events"]) > 0
+
+    # Direct Python replay reproduces deterministically
+    rep = replay_concurrency_trace(repo, "HEAD", res.concurrency_trace)
+    assert rep["status"] == "REPRODUCED"
+    assert rep["seed"] == res.concurrency_trace["seed"]
+
+    # CLI replay-concurrency reproduces deterministically with exit 2
+    trace_file = tmp_path / "trace.json"
+    trace_file.write_text(json.dumps({"concurrency_trace": res.concurrency_trace}), encoding="utf-8")
+    rc = cli_main([
+        "replay-concurrency",
+        "--repo", str(repo),
+        "--head", "HEAD",
+        "--trace", str(trace_file),
+        "--json",
+    ])
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "REPRODUCED"
