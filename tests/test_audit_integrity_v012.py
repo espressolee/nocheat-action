@@ -213,12 +213,16 @@ def test_deterministic_concurrency_trace_and_replay_cli(tmp_path: Path, capsys):
     assert res.concurrency_trace["mode"] == "asyncio"
     assert len(res.concurrency_trace["schedule_events"]) > 0
 
-    # Direct Python replay reproduces deterministically
+    # Direct Python replay enforces recorded trace + binding + witness
     rep = replay_concurrency_trace(repo, "HEAD", res.concurrency_trace)
-    assert rep["status"] == "REPRODUCED"
-    assert rep["seed"] == res.concurrency_trace["seed"]
+    assert rep["status"] == "REPRODUCED", rep
+    assert rep["binding_verified"] is True
+    assert rep["trace_complete"] is True
+    assert rep["schedule_enforced"] is True
+    assert rep["witness_matched"] is True
+    assert rep["replay_divergence"] is None
 
-    # CLI replay-concurrency reproduces deterministically with exit 2
+    # CLI replay-concurrency reproduces with exit 2 AND valid structured JSON (distinguished from argparse exit 2)
     trace_file = tmp_path / "trace.json"
     trace_file.write_text(json.dumps({"concurrency_trace": res.concurrency_trace}), encoding="utf-8")
     rc = cli_main([
@@ -231,3 +235,62 @@ def test_deterministic_concurrency_trace_and_replay_cli(tmp_path: Path, capsys):
     assert rc == 2
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "REPRODUCED"
+    assert out["binding_verified"] is True
+    assert out["schedule_enforced"] is True
+    assert out["witness_matched"] is True
+
+    # Negative Counterexample 1: Delete middle event from schedule_events -> TRACE_DIVERGED (exit 1)
+    tampered_events = list(res.concurrency_trace["schedule_events"])
+    assert len(tampered_events) >= 2
+    del tampered_events[0]
+    tr_deleted = dict(res.concurrency_trace, schedule_events=tampered_events)
+    rep_del = replay_concurrency_trace(repo, "HEAD", tr_deleted)
+    assert rep_del["status"] == "TRACE_DIVERGED", rep_del
+    assert rep_del["schedule_enforced"] is False
+
+    # Negative Counterexample 2: Different HEAD commit -> BINDING_MISMATCH (never REPRODUCED)
+    rep_diff_head = replay_concurrency_trace(repo, "main", res.concurrency_trace)
+    assert rep_diff_head["status"] == "BINDING_MISMATCH", rep_diff_head
+    assert rep_diff_head["binding_verified"] is False
+
+    # Negative Counterexample 3: Truncated / timeout trace -> TRACE_INCOMPLETE
+    tr_trunc = dict(res.concurrency_trace, trace_complete=False, trace_truncated=True)
+    rep_trunc = replay_concurrency_trace(repo, "HEAD", tr_trunc)
+    assert rep_trunc["status"] == "TRACE_INCOMPLETE", rep_trunc
+
+    # Negative Counterexample 4: Actor registration order altered in trace -> TRACE_DIVERGED
+    tr_reordered = dict(res.concurrency_trace, schedule_events=list(reversed(res.concurrency_trace["schedule_events"])))
+    rep_reord = replay_concurrency_trace(repo, "HEAD", tr_reordered)
+    assert rep_reord["status"] == "TRACE_DIVERGED", rep_reord
+
+    # Negative Counterexample 5: Unrelated ImportError during replay (instead of race assertion) -> WITNESS_MISMATCH
+    with patch(
+        "nocheat_gate.concurrency_gate._run_one_pct_schedule",
+        return_value={
+            "status": "runner_error",
+            "concurrent_observed": False,
+            "observed_steps": len(res.concurrency_trace["schedule_events"]),
+            "detail": "ModuleNotFoundError: No module named 'missing_dep'",
+            "schedule_events": list(res.concurrency_trace["schedule_events"]),
+            "trace_complete": True,
+            "trace_truncated": False,
+            "replay_cursor": len(res.concurrency_trace["schedule_events"]),
+            "replay_divergence": None,
+            "witness_signature": {
+                "witness_kind": "runner_error",
+                "exception_type": "ModuleNotFoundError",
+                "failing_test": None,
+                "returncode": 2,
+            },
+        },
+    ):
+        rep_imp = replay_concurrency_trace(repo, "HEAD", res.concurrency_trace)
+    assert rep_imp["status"] == "WITNESS_MISMATCH", rep_imp
+    assert rep_imp["witness_matched"] is False
+
+    # Negative Counterexample 6: CLI argparse error returns exit 2 with EMPTY stdout (never mistaken for REPRODUCED JSON)
+    import pytest
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(["replay-concurrency", "--repo", str(repo)])  # missing required --trace
+    assert exc_info.value.code == 2
+    assert capsys.readouterr().out.strip() == ""

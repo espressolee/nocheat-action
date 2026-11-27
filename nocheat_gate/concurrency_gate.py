@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 import time
 
 from .diff_scope import ChangedScope, FileDiffSummary, git_show_file
@@ -336,13 +339,54 @@ bug_depth = int(payload["bug_depth"])
 seed = int(payload["seed"])
 scope_files = {os.path.realpath(p) for p in payload["scope_abs_paths"]}
 reverse_base = bool(payload.get("reverse_base", False))
-
 est_steps = int(payload.get("est_steps", 24))
+replay_events = payload.get("replay_events")
+trace_file_path = payload.get("trace_file")
+MAX_TRACE_EVENTS = int(payload.get("max_trace_events", 512))
 
 STATE = {
     "concurrent_observed": False,
     "deadlock_cycle": None,
+    "schedule_events": [],
+    "total_schedule_steps": 0,
+    "trace_truncated": False,
+    "replay_cursor": 0,
+    "replay_divergence": None,
+    "async_actor_ids": {},
+    "async_name_counts": collections.Counter(),
+    "thread_actor_ids": {},
+    "thread_name_counts": collections.Counter(),
 }
+
+_trace_fp = open(trace_file_path, "w", encoding="utf-8", buffering=1) if trace_file_path else None
+
+
+def _record_event(actor_id: str) -> None:
+    STATE["total_schedule_steps"] += 1
+    ev_list = STATE["schedule_events"]
+    if len(ev_list) < MAX_TRACE_EVENTS:
+        ev_list.append(actor_id)
+        if _trace_fp is not None:
+            try:
+                _trace_fp.write(actor_id + "\n")
+            except OSError:
+                pass
+    else:
+        STATE["trace_truncated"] = True
+
+
+def _logical_async_id(task) -> str:
+    tid = id(task)
+    existing = STATE["async_actor_ids"].get(tid)
+    if existing is not None:
+        return existing
+    coro = task.get_coro() if hasattr(task, "get_coro") else None
+    qname = getattr(coro, "__qualname__", None) or getattr(task, "get_name", lambda: "task")()
+    idx = STATE["async_name_counts"][qname]
+    STATE["async_name_counts"][qname] += 1
+    aid = f"async:{qname}#{idx}"
+    STATE["async_actor_ids"][tid] = aid
+    return aid
 
 
 class _PctPriorityPool:
@@ -362,25 +406,25 @@ class _PctPriorityPool:
             for idx, pt in enumerate(chosen, start=1):
                 self.lowering_points[pt] = idx
 
-    def ensure_prio(self, tid: int) -> int:
-        if tid not in self.prios:
+    def ensure_prio(self, actor_key) -> int:
+        if actor_key not in self.prios:
             if self.rev:
                 val = 1000 + len(self.prios)
             else:
                 val = self.depth + self.rng.randint(1, 100000)
                 while val in self.prios.values():
                     val = self.depth + self.rng.randint(1, 100000)
-            self.prios[tid] = val
-        return self.prios[tid]
+            self.prios[actor_key] = val
+        return self.prios[actor_key]
 
-    def on_step_dispatched(self, tid: int) -> None:
+    def on_step_dispatched(self, actor_key) -> None:
         self.step += 1
         if self.step in self.lowering_points:
-            self.prios[tid] = self.lowering_points[self.step]
+            self.prios[actor_key] = self.lowering_points[self.step]
 
 
 class _PctSelectorEventLoop(asyncio.SelectorEventLoop):
-    """Single-step Burckhardt PCT asyncio event loop."""
+    """Single-step Burckhardt PCT & trace-enforced asyncio event loop."""
 
     def __init__(self, pct_pool: _PctPriorityPool):
         super().__init__()
@@ -400,14 +444,13 @@ class _PctSelectorEventLoop(asyncio.SelectorEventLoop):
             cb = getattr(h, "_callback", None)
             owner = getattr(cb, "__self__", None)
             if isinstance(owner, asyncio.Task):
-                task_handles.append((h, owner))
+                task_handles.append((h, owner, _logical_async_id(owner)))
             else:
                 non_task_handles.append(h)
 
         if len(task_handles) >= 2:
             STATE["concurrent_observed"] = True
 
-        # Dispatch non-task handle first, keeping all other handles deferred so tasks aren't batch-drained FIFO
         if non_task_handles:
             chosen_h = non_task_handles[0]
             deferred = [h for h in ready if h is not chosen_h]
@@ -420,22 +463,40 @@ class _PctSelectorEventLoop(asyncio.SelectorEventLoop):
         if not task_handles:
             return super()._run_once()
 
-        # Choose single highest-priority ready Task handle
-        chosen_h, chosen_task = max(
-            task_handles,
-            key=lambda item: self._pct_pool.ensure_prio(id(item[1])),
-        )
-        tid = id(chosen_task)
-        slot = STATE.setdefault("async_slots", {}).setdefault(tid, len(STATE.setdefault("async_slots", {})))
-        ev_list = STATE.setdefault("schedule_events", [])
-        if len(ev_list) < 64:
-            ev_list.append(f"async:{slot}")
+        chosen_h = None
+        chosen_actor = None
+        if replay_events is not None:
+            cur = STATE["replay_cursor"]
+            if cur < len(replay_events):
+                expected = replay_events[cur]
+                for h, _, aid in task_handles:
+                    if aid == expected:
+                        chosen_h = h
+                        chosen_actor = aid
+                        STATE["replay_cursor"] = cur + 1
+                        break
+                if chosen_h is None and STATE["replay_divergence"] is None:
+                    STATE["replay_divergence"] = (
+                        f"step={cur}:expected={expected}:ready={[aid for _, _, aid in task_handles]}"
+                    )
+            elif STATE["replay_divergence"] is None:
+                STATE["replay_divergence"] = (
+                    f"step={cur}:trace_exhausted:ready={[aid for _, _, aid in task_handles]}"
+                )
+
+        if chosen_h is None:
+            chosen_h, _, chosen_actor = max(
+                task_handles,
+                key=lambda item: self._pct_pool.ensure_prio(item[2]),
+            )
+
+        _record_event(chosen_actor)
         deferred = [h for h in ready if h is not chosen_h]
         self._ready = collections.deque([chosen_h])
         try:
             super()._run_once()
         finally:
-            self._pct_pool.on_step_dispatched(id(chosen_task))
+            self._pct_pool.on_step_dispatched(chosen_actor)
             for h in reversed(deferred):
                 self._ready.appendleft(h)
 
@@ -458,7 +519,6 @@ def _install_threading_pct(pct_pool: _PctPriorityPool):
     held_by_thread = collections.defaultdict(list)
     trace_steps = collections.Counter()
 
-    # Check lock-order cycles on threading.Lock / RLock
     orig_lock_factory = threading.Lock
     orig_rlock_factory = threading.RLock
 
@@ -474,7 +534,6 @@ def _install_threading_pct(pct_pool: _PctPriorityPool):
                 if prev_held:
                     for h_id in prev_held:
                         if h_id != self._id:
-                            # Record directed lock edge via thread-safe dict lookup
                             edge = (h_id, self._id)
                             rev = (self._id, h_id)
                             if rev in lock_owners and STATE["deadlock_cycle"] is None:
@@ -485,7 +544,6 @@ def _install_threading_pct(pct_pool: _PctPriorityPool):
                     if ok:
                         held_by_thread[me].append(self._id)
                     return ok
-                # Non-blocking fast path before dropping out of runnable set
                 if self._raw.acquire(False):
                     held_by_thread[me].append(self._id)
                     return True
@@ -527,7 +585,6 @@ def _install_threading_pct(pct_pool: _PctPriorityPool):
             caller_file = os.path.realpath(sys._getframe(2).f_code.co_filename)
         except Exception:
             caller_file = ""
-        # If caller is from Python stdlib, pytest, or external packages, always return genuine C lock
         if "lib/python" in caller_file or "site-packages" in caller_file or (scope_files and caller_file not in scope_files):
             return orig_rlock_factory() if reentrant else orig_lock_factory()
         return _TrackedLock(reentrant=reentrant)
@@ -544,41 +601,77 @@ def _install_threading_pct(pct_pool: _PctPriorityPool):
         me = threading.get_ident()
         if me not in runnable:
             return _trace
-        if trace_steps[me] > 400:
+        if trace_steps[me] >= 400:
+            STATE["trace_truncated"] = True
             return None
         trace_steps[me] += 1
         with sched_cond:
-            pct_pool.ensure_prio(me)
+            actor_id = STATE["thread_actor_ids"].get(me, f"thread:unknown#{me}")
+            pct_pool.ensure_prio(actor_id)
             active_runnable = runnable - blocked
             if len(active_runnable) >= 2:
                 STATE["concurrent_observed"] = True
+
+            if replay_events is not None:
+                wait_until = time.monotonic() + 0.12
+                matched_step = False
+                while True:
+                    cur = STATE["replay_cursor"]
+                    if cur >= len(replay_events):
+                        if STATE["replay_divergence"] is None:
+                            STATE["replay_divergence"] = f"step={cur}:trace_exhausted:got={actor_id}"
+                        break
+                    if replay_events[cur] == actor_id:
+                        STATE["replay_cursor"] = cur + 1
+                        matched_step = True
+                        break
+                    if time.monotonic() >= wait_until or me in blocked:
+                        if STATE["replay_divergence"] is None:
+                            STATE["replay_divergence"] = (
+                                f"step={cur}:expected={replay_events[cur]}:got={actor_id}"
+                            )
+                        break
+                    sched_cond.wait(timeout=0.003)
+                _record_event(actor_id)
+                pct_pool.on_step_dispatched(actor_id)
+                sched_cond.notify_all()
+                return _trace
+
             wait_until = time.monotonic() + 0.025
             while True:
                 active_runnable = runnable - blocked
                 if not active_runnable or me in blocked:
                     break
-                best = max(active_runnable, key=lambda t: pct_pool.ensure_prio(t))
+                best = max(
+                    active_runnable,
+                    key=lambda t: pct_pool.ensure_prio(STATE["thread_actor_ids"].get(t, f"thread:unknown#{t}")),
+                )
                 if best == me or time.monotonic() >= wait_until:
                     break
                 sched_cond.wait(timeout=0.003)
-            pct_pool.on_step_dispatched(me)
-            t_slot = STATE.setdefault("thread_slots", {}).setdefault(me, len(STATE.setdefault("thread_slots", {})))
-            ev_list = STATE.setdefault("schedule_events", [])
-            if len(ev_list) < 64:
-                ev_list.append(f"thread:{t_slot}")
+            pct_pool.on_step_dispatched(actor_id)
+            _record_event(actor_id)
             sched_cond.notify_all()
         return _trace
 
     orig_start = threading.Thread.start
 
     def _wrapped_start(self):
+        # Assign logical actor ID deterministically in parent spawn order (never OS wakeup order)
+        tgt = getattr(self, "_target", None)
+        tname = getattr(tgt, "__qualname__", None) or getattr(tgt, "__name__", None) or self.__class__.__name__
+        with sched_cond:
+            idx = STATE["thread_name_counts"][tname]
+            STATE["thread_name_counts"][tname] += 1
+            logical_id = f"thread:{tname}#{idx}"
         orig_run = self.run
 
         def _pct_run(*a, **kw):
             me = threading.get_ident()
             with sched_cond:
+                STATE["thread_actor_ids"][me] = logical_id
                 runnable.add(me)
-                pct_pool.ensure_prio(me)
+                pct_pool.ensure_prio(logical_id)
                 if len(runnable) < 2:
                     sched_cond.wait(timeout=0.004)
                 if len(runnable) >= 2:
@@ -626,13 +719,109 @@ if STATE["deadlock_cycle"] and rc == 0:
     print(f"PCT_WITNESS:{STATE['deadlock_cycle']}", file=sys.stderr)
     rc = 1
 
+if _trace_fp is not None:
+    try:
+        _trace_fp.close()
+    except OSError:
+        pass
+
 obs_steps = max(async_pool.step, thread_pool.step if thread_pool else 0)
-print(
-    f"__PCT_META__={json.dumps({'concurrent_observed': STATE['concurrent_observed'], 'observed_steps': obs_steps, 'rc': rc, 'schedule_events': STATE.get('schedule_events', [])[:64]})}",
-    flush=True,
-)
+meta_out = {
+    "concurrent_observed": STATE["concurrent_observed"],
+    "observed_steps": obs_steps,
+    "rc": rc,
+    "schedule_events": STATE["schedule_events"][:MAX_TRACE_EVENTS],
+    "total_schedule_steps": STATE["total_schedule_steps"],
+    "trace_truncated": bool(STATE["trace_truncated"]),
+    "replay_cursor": int(STATE["replay_cursor"]),
+    "replay_divergence": STATE["replay_divergence"],
+}
+print(f"__PCT_META__={json.dumps(meta_out)}", flush=True)
 sys.exit(rc)
 '''
+
+_HARNESS_DIGEST = hashlib.sha256(_PCT_HARNESS.encode("utf-8")).hexdigest()[:16]
+_FAILED_NODE_RE = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
+_EXC_TYPE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b")
+_RUNNER_ERR_TYPES = frozenset({"ImportError", "ModuleNotFoundError", "SyntaxError", "IndentationError"})
+
+
+def _resolve_git_binding(repo_dir: Path, head_ref: str) -> tuple[str | None, str | None]:
+    """Resolve exact commit OID and tree OID for code binding checks."""
+    head_oid: str | None = None
+    tree_oid: str | None = None
+    try:
+        hp = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(repo_dir), "rev-parse", "--verify", f"{head_ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if hp.returncode == 0 and hp.stdout.strip():
+            head_oid = hp.stdout.strip()
+        tp = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(repo_dir), "rev-parse", "--verify", f"{head_ref}^{{tree}}"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if tp.returncode == 0 and tp.stdout.strip():
+            tree_oid = tp.stdout.strip()
+    except Exception:
+        pass
+    return head_oid, tree_oid
+
+
+def _extract_witness_signature(returncode: int, runner_mode: str, stdout: str, stderr: str) -> dict:
+    """Extract structured witness kind, exception type, and failing test node; separate runner/import errors."""
+    combined = f"{stdout}\n{stderr}"
+    if "PCT_WITNESS:LOCK_ORDER_CYCLE" in combined:
+        return {
+            "witness_kind": "deadlock",
+            "exception_type": "LOCK_ORDER_CYCLE",
+            "failing_test": None,
+            "returncode": returncode,
+        }
+    if returncode == 0:
+        return {
+            "witness_kind": "none",
+            "exception_type": None,
+            "failing_test": None,
+            "returncode": 0,
+        }
+    failed_m = _FAILED_NODE_RE.search(combined)
+    failing_test = failed_m.group(1) if failed_m else None
+    exc_matches = _EXC_TYPE_RE.findall(combined)
+    exc_type = exc_matches[-1] if exc_matches else None
+
+    if (runner_mode == "pytest" and returncode in (2, 3, 4, 5)) or (exc_type in _RUNNER_ERR_TYPES):
+        return {
+            "witness_kind": "runner_error",
+            "exception_type": exc_type or f"PYTEST_EXIT_{returncode}",
+            "failing_test": failing_test,
+            "returncode": returncode,
+        }
+    if exc_type == "AssertionError" or "assert " in combined or "AssertionError" in combined:
+        return {
+            "witness_kind": "assertion",
+            "exception_type": "AssertionError",
+            "failing_test": failing_test,
+            "returncode": returncode,
+        }
+    return {
+        "witness_kind": "runtime_exception",
+        "exception_type": exc_type or f"EXIT_{returncode}",
+        "failing_test": failing_test,
+        "returncode": returncode,
+    }
+
+
+def _witness_matches(expected: dict | None, actual: dict) -> bool:
+    if not isinstance(expected, dict) or actual.get("witness_kind") in ("none", "runner_error"):
+        return False
+    if expected.get("witness_kind") != actual.get("witness_kind"):
+        return False
+    if expected.get("exception_type") and actual.get("exception_type") != expected.get("exception_type"):
+        return False
+    if expected.get("failing_test") and actual.get("failing_test") != expected.get("failing_test"):
+        return False
+    return True
 
 
 def _run_one_pct_schedule(
@@ -648,7 +837,11 @@ def _run_one_pct_schedule(
     est_steps: int,
     timeout_s: float,
     env: dict[str, str],
-) -> tuple[str, bool, int, str, list[str]]:
+    replay_events: list[str] | None = None,
+) -> dict:
+    with tempfile.NamedTemporaryFile(prefix="nocheat_pct_trace_", suffix=".log", delete=False) as tf:
+        trace_file = Path(tf.name)
+
     payload = {
         "runner_mode": runner_mode,
         "targets": targets,
@@ -658,7 +851,10 @@ def _run_one_pct_schedule(
         "scope_abs_paths": scope_abs_paths,
         "reverse_base": reverse_base,
         "est_steps": est_steps,
+        "trace_file": str(trace_file),
     }
+    if replay_events is not None:
+        payload["replay_events"] = list(replay_events)
     t_env = dict(env)
     try:
         proc = subprocess.run(
@@ -670,33 +866,69 @@ def _run_one_pct_schedule(
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return (
-            "timeout",
-            False,
-            est_steps,
-            f"PCT_SCHEDULE_TIMEOUT_INCONCLUSIVE(mode={mode},d={bug_depth},seed={seed})",
-            [],
-        )
+        partial_events: list[str] = []
+        try:
+            if trace_file.exists():
+                partial_events = [ln.strip() for ln in trace_file.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()][:512]
+        except OSError:
+            pass
+        finally:
+            trace_file.unlink(missing_ok=True)
+        return {
+            "status": "timeout",
+            "concurrent_observed": len(set(partial_events)) >= 2,
+            "observed_steps": len(partial_events) or est_steps,
+            "detail": f"PCT_SCHEDULE_TIMEOUT_INCONCLUSIVE(mode={mode},d={bug_depth},seed={seed})",
+            "schedule_events": partial_events,
+            "trace_complete": False,
+            "trace_truncated": True,
+            "replay_cursor": 0,
+            "replay_divergence": None,
+            "witness_signature": {"witness_kind": "timeout", "exception_type": "TimeoutExpired", "failing_test": None, "returncode": -1},
+        }
+    finally:
+        trace_file.unlink(missing_ok=True)
 
     concurrent_obs = False
     obs_steps = est_steps
     sched_events: list[str] = []
+    trace_truncated = False
+    meta_found = False
+    replay_cursor = 0
+    replay_divergence: str | None = None
     for ln in reversed(proc.stdout.splitlines()):
         if ln.startswith("__PCT_META__="):
             try:
                 meta = json.loads(ln.split("=", 1)[1])
+                meta_found = True
                 concurrent_obs = bool(meta.get("concurrent_observed", False))
                 if isinstance(meta.get("observed_steps"), int) and meta["observed_steps"] > 0:
                     obs_steps = meta["observed_steps"]
                 raw_ev = meta.get("schedule_events")
                 if isinstance(raw_ev, list):
-                    sched_events = [str(x) for x in raw_ev[:64]]
+                    sched_events = [str(x) for x in raw_ev[:512]]
+                trace_truncated = bool(meta.get("trace_truncated", False))
+                replay_cursor = int(meta.get("replay_cursor", 0))
+                replay_divergence = meta.get("replay_divergence")
             except json.JSONDecodeError:
                 pass
             break
-    status = "passed" if proc.returncode == 0 else "failed"
+
+    witness_sig = _extract_witness_signature(proc.returncode, runner_mode, proc.stdout, proc.stderr)
+    status = "passed" if proc.returncode == 0 else ("runner_error" if witness_sig["witness_kind"] == "runner_error" else "failed")
     detail = (proc.stderr or proc.stdout).strip()[-350:]
-    return status, concurrent_obs, obs_steps, detail, sched_events
+    return {
+        "status": status,
+        "concurrent_observed": concurrent_obs,
+        "observed_steps": obs_steps,
+        "detail": detail,
+        "schedule_events": sched_events,
+        "trace_complete": bool(meta_found and not trace_truncated),
+        "trace_truncated": bool(trace_truncated or not meta_found),
+        "replay_cursor": replay_cursor,
+        "replay_divergence": replay_divergence,
+        "witness_signature": witness_sig,
+    }
 
 
 def run_concurrency_pct_gate(
@@ -744,6 +976,7 @@ def run_concurrency_pct_gate(
     scope_abs = [str((worktree / rp).resolve()) for rp in analysis.target_rel_paths] + [
         str((worktree / t).resolve()) for t in targets
     ]
+    head_oid, tree_oid = _resolve_git_binding(repo_dir, head_ref)
 
     schedule_plan: list[tuple[int, int, bool]] = [
         (1, 0, True),
@@ -755,14 +988,14 @@ def run_concurrency_pct_gate(
     runs = 0
     concurrent_observed = False
     est_steps = 24
-    timeout_reason: str | None = None
-    timeout_trace: dict | None = None
+    inconclusive_reason: str | None = None
+    inconclusive_trace: dict | None = None
     for depth, seed, rev in schedule_plan:
         if time.monotonic() - t0 >= total_pct_budget_s:
             break
         runs += 1
         used_est_steps = est_steps
-        status, conc_obs, obs_steps, detail, sched_events = _run_one_pct_schedule(
+        run_res = _run_one_pct_schedule(
             worktree,
             runner_mode,
             targets,
@@ -775,25 +1008,36 @@ def run_concurrency_pct_gate(
             timeout_s=per_schedule_timeout_s,
             env=env,
         )
+        status = run_res["status"]
+        obs_steps = int(run_res["observed_steps"])
+        detail = str(run_res["detail"])
         if runs == 1 and obs_steps > 0:
             est_steps = max(4, obs_steps)
-        concurrent_observed = concurrent_observed or conc_obs
+        concurrent_observed = concurrent_observed or bool(run_res["concurrent_observed"])
+
+        trace_obj = {
+            "schema": "nocheat.concurrency_trace.v1",
+            "head_oid": head_oid,
+            "tree_oid": tree_oid,
+            "harness_digest": _HARNESS_DIGEST,
+            "runner_mode": runner_mode,
+            "targets": list(targets),
+            "scope_rel_paths": list(analysis.target_rel_paths),
+            "mode": mode,
+            "bug_depth": depth,
+            "seed": seed,
+            "reverse_base": rev,
+            "est_steps": used_est_steps,
+            "outcome": status,
+            "concurrent_observed": concurrent_observed,
+            "observed_steps": obs_steps,
+            "trace_complete": bool(run_res["trace_complete"]),
+            "trace_truncated": bool(run_res["trace_truncated"]),
+            "witness_signature": run_res["witness_signature"],
+            "schedule_events": list(run_res["schedule_events"]),
+        }
+
         if status == "failed":
-            trace_obj = {
-                "schema": "nocheat.concurrency_trace.v1",
-                "runner_mode": runner_mode,
-                "targets": list(targets),
-                "scope_rel_paths": list(analysis.target_rel_paths),
-                "mode": mode,
-                "bug_depth": depth,
-                "seed": seed,
-                "reverse_base": rev,
-                "est_steps": used_est_steps,
-                "outcome": "failed",
-                "concurrent_observed": concurrent_observed,
-                "observed_steps": obs_steps,
-                "schedule_events": sched_events[:64],
-            }
             return ConcurrencyGateReport(
                 triggered=True,
                 verdict="BLOCK",
@@ -811,25 +1055,15 @@ def run_concurrency_pct_gate(
                 elapsed_s=time.monotonic() - t0,
                 schedule_trace=trace_obj,
             )
-        if status == "timeout" and timeout_reason is None:
-            timeout_reason = detail
-            timeout_trace = {
-                "schema": "nocheat.concurrency_trace.v1",
-                "runner_mode": runner_mode,
-                "targets": list(targets),
-                "scope_rel_paths": list(analysis.target_rel_paths),
-                "mode": mode,
-                "bug_depth": depth,
-                "seed": seed,
-                "reverse_base": rev,
-                "est_steps": used_est_steps,
-                "outcome": "timeout",
-                "concurrent_observed": concurrent_observed,
-                "observed_steps": obs_steps,
-                "schedule_events": sched_events[:64],
-            }
+        if status in ("timeout", "runner_error") and inconclusive_reason is None:
+            inconclusive_reason = (
+                detail
+                if status == "timeout"
+                else f"PCT_RUNNER_ERROR_INCONCLUSIVE(mode={mode},d={depth},seed={seed}): {detail}"
+            )
+            inconclusive_trace = trace_obj
 
-    if timeout_reason is not None:
+    if inconclusive_reason is not None:
         return ConcurrencyGateReport(
             triggered=True,
             verdict="ABSTAIN",
@@ -841,9 +1075,9 @@ def run_concurrency_pct_gate(
             pct_bug_depth=None,
             schedules_run=runs,
             concurrent_observed=concurrent_observed,
-            reasons=(timeout_reason,),
+            reasons=(inconclusive_reason,),
             elapsed_s=time.monotonic() - t0,
-            schedule_trace=timeout_trace,
+            schedule_trace=inconclusive_trace,
         )
 
     if analysis.unguarded_shared_writes and not concurrent_observed:
@@ -888,7 +1122,9 @@ def replay_concurrency_trace(
     *,
     timeout_s: float = 4.0,
 ) -> dict:
-    """Deterministically replay a recorded `nocheat.concurrency_trace.v1` schedule in an isolated worktree."""
+    """Strictly replay a recorded `nocheat.concurrency_trace.v1` trace with code/harness binding,
+    trace-guided schedule enforcement, divergence detection, and witness verification.
+    """
     if not isinstance(trace, dict) or trace.get("schema") != "nocheat.concurrency_trace.v1":
         raise ValueError("INVALID_CONCURRENCY_TRACE_SCHEMA")
     from .runner import _build_env, temporary_checkout
@@ -901,14 +1137,75 @@ def replay_concurrency_trace(
     seed = int(trace.get("seed", 0))
     reverse_base = bool(trace.get("reverse_base", False))
     est_steps = max(4, int(trace.get("est_steps", 24)))
+    recorded_events = [str(x) for x in (trace.get("schedule_events") or ())]
     if not targets:
         raise ValueError("CONCURRENCY_TRACE_MISSING_TARGETS")
 
-    with temporary_checkout(Path(repo_dir).resolve(), head_ref) as worktree:
+    repo_resolved = Path(repo_dir).resolve()
+    actual_head_oid, actual_tree_oid = _resolve_git_binding(repo_resolved, head_ref)
+    expected_head_oid = trace.get("head_oid")
+    expected_tree_oid = trace.get("tree_oid")
+    expected_digest = trace.get("harness_digest")
+
+    base_resp = {
+        "schema": "nocheat.concurrency_replay.v1",
+        "trace_schema": trace["schema"],
+        "mode": mode,
+        "bug_depth": bug_depth,
+        "seed": seed,
+        "reverse_base": reverse_base,
+        "est_steps": est_steps,
+        "head_oid": actual_head_oid,
+        "tree_oid": actual_tree_oid,
+        "harness_digest": _HARNESS_DIGEST,
+        "binding_verified": False,
+        "trace_complete": bool(trace.get("trace_complete", False)),
+        "schedule_enforced": False,
+        "witness_matched": False,
+        "replay_divergence": None,
+        "concurrent_observed": False,
+        "observed_steps": 0,
+        "schedule_events": [],
+        "witness_signature": None,
+        "detail": "",
+    }
+
+    # 1. Verify exact code + harness binding
+    if (
+        not expected_head_oid
+        or not actual_head_oid
+        or actual_head_oid != expected_head_oid
+        or (expected_tree_oid and actual_tree_oid != expected_tree_oid)
+        or expected_digest != _HARNESS_DIGEST
+    ):
+        base_resp["status"] = "BINDING_MISMATCH"
+        base_resp["outcome"] = "binding_mismatch"
+        base_resp["detail"] = (
+            f"head={actual_head_oid} vs expected={expected_head_oid}; "
+            f"harness={_HARNESS_DIGEST} vs expected={expected_digest}"
+        )
+        return base_resp
+
+    base_resp["binding_verified"] = True
+
+    # 2. Verify recorded trace completeness and valid failed witness source
+    if (
+        trace.get("outcome") != "failed"
+        or trace.get("trace_complete") is not True
+        or trace.get("trace_truncated") is True
+        or not recorded_events
+    ):
+        base_resp["status"] = "TRACE_INCOMPLETE"
+        base_resp["outcome"] = str(trace.get("outcome") or "incomplete")
+        base_resp["detail"] = "Recorded trace is truncated, timed out, or has no schedule events."
+        return base_resp
+
+    # 3. Execute trace-guided replay inside isolated checkout
+    with temporary_checkout(repo_resolved, head_ref) as worktree:
         scope_abs = [str((worktree / rp).resolve()) for rp in scope_rels] + [
             str((worktree / t).resolve()) for t in targets
         ]
-        status, conc_obs, obs_steps, detail, events = _run_one_pct_schedule(
+        run_res = _run_one_pct_schedule(
             worktree,
             runner_mode,
             targets,
@@ -920,24 +1217,42 @@ def replay_concurrency_trace(
             est_steps=est_steps,
             timeout_s=timeout_s,
             env=_build_env(worktree),
+            replay_events=recorded_events,
         )
-    replay_status = (
-        "REPRODUCED"
-        if status == "failed"
-        else ("TIMEOUT" if status == "timeout" else "NOT_REPRODUCED")
+
+    status = run_res["status"]
+    divergence = run_res["replay_divergence"]
+    consumed = int(run_res["replay_cursor"])
+    exact_events_match = (
+        divergence is None
+        and consumed == len(recorded_events)
+        and list(run_res["schedule_events"]) == recorded_events
     )
-    return {
-        "schema": "nocheat.concurrency_replay.v1",
-        "trace_schema": trace["schema"],
-        "status": replay_status,
+    witness_ok = _witness_matches(trace.get("witness_signature"), run_res["witness_signature"])
+
+    base_resp.update({
         "outcome": status,
-        "mode": mode,
-        "bug_depth": bug_depth,
-        "seed": seed,
-        "reverse_base": reverse_base,
-        "est_steps": est_steps,
-        "concurrent_observed": conc_obs,
-        "observed_steps": obs_steps,
-        "schedule_events": events,
-        "detail": detail,
-    }
+        "concurrent_observed": bool(run_res["concurrent_observed"]),
+        "observed_steps": int(run_res["observed_steps"]),
+        "schedule_events": list(run_res["schedule_events"]),
+        "replay_divergence": divergence or (
+            None if exact_events_match else f"consumed={consumed}/{len(recorded_events)}"
+        ),
+        "schedule_enforced": bool(exact_events_match),
+        "witness_signature": run_res["witness_signature"],
+        "witness_matched": bool(witness_ok),
+        "detail": str(run_res["detail"]),
+    })
+
+    if status == "timeout":
+        base_resp["status"] = "TIMEOUT"
+    elif not exact_events_match:
+        base_resp["status"] = "TRACE_DIVERGED"
+    elif status == "passed":
+        base_resp["status"] = "NOT_REPRODUCED"
+    elif status != "failed" or not witness_ok:
+        base_resp["status"] = "WITNESS_MISMATCH"
+    else:
+        base_resp["status"] = "REPRODUCED"
+
+    return base_resp

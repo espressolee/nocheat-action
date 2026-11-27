@@ -764,6 +764,8 @@ def _replay_concurrency_cli(argv: list[str]) -> int:
         return 2
     if res['status'] == 'TIMEOUT':
         return 3
+    if res['status'] in ('BINDING_MISMATCH', 'TRACE_INCOMPLETE', 'TRACE_DIVERGED', 'WITNESS_MISMATCH'):
+        return 1
     return 0
 
 
