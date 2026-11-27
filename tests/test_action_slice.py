@@ -1679,3 +1679,39 @@ def test_narrowing_except_header_does_not_mutate_untouched_body():
     sc_body = ChangedScope("winterm.py", "enable_vt", 1, 5, frozenset({4, 5}))
     muts_body = generate_diff_mutants("winterm.py", src_narrow, sc_body)
     assert any("Except -> raise" in m.desc for m in muts_body)
+
+
+def test_cli_stdout_and_summary_print_contract_counterexample_details(tmp_path: Path, capsys):
+    repos = build_all(tmp_path)
+    summary_file = tmp_path / "step_summary.md"
+    rc = main(
+        [
+            "--repo",
+            str(repos["pr3_ai_shortcut"]),
+            "--base",
+            "main",
+            "--head",
+            "HEAD",
+            "--mode",
+            "enforce",
+            "--summary-file",
+            str(summary_file),
+        ]
+    )
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "Contract counterexamples:" in out
+    assert "billing:charge" in out
+    assert "ensures=result >= 0 and result == units * (2 if premium else 3)" in out
+    assert "inputs=" in out
+    assert "base=" in out
+    assert "head=" in out
+
+    summary = summary_file.read_text(encoding="utf-8")
+    assert "billing:charge" in summary
+    assert "ensures" in summary
+    assert "units * (2 if premium else 3)" in summary
+    assert "inputs" in summary
+    assert "base" in summary
+    assert "head" in summary
+

@@ -191,9 +191,12 @@ def render_markdown_summary(res: GateResult, mode: str) -> str:
         for witness in contract.counterexamples:
             calls = getattr(witness, "sequence", None)
             label, value = ("sequence", calls) if calls is not None else ("inputs", witness.inputs)
+            ensures = getattr(witness, "ensures", None)
+            ensures_part = f" · ensures {_code(str(ensures))}" if ensures else ""
             lines.append(
-                f"- `{witness.target}` · {label} `{json.dumps(value, sort_keys=True)}` · "
-                f"base `{json.dumps(witness.baseline)}` · head `{json.dumps(witness.candidate)}`"
+                f"- {_code(witness.target)}{ensures_part} · {label} {_code(json.dumps(value, sort_keys=True))} · "
+                f"base {_code(json.dumps(witness.baseline, sort_keys=True))} · "
+                f"head {_code(json.dumps(witness.candidate, sort_keys=True))}"
             )
         lines.append("")
 
@@ -550,6 +553,19 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         if res.surviving_mutant_details:
             print('Surviving diff mutants:')
             print('\n'.join(_surviving_mutants(res, markdown=False)))
+        if res.contract_report is not None and res.contract_report.counterexamples:
+            print('Contract counterexamples:')
+            for witness in res.contract_report.counterexamples[:5]:
+                calls = getattr(witness, 'sequence', None)
+                label, value = ('sequence', calls) if calls is not None else ('inputs', witness.inputs)
+                ensures = getattr(witness, 'ensures', None)
+                ensures_part = f' · ensures={_single_line(str(ensures), 120)}' if ensures else ''
+                print(
+                    f'  - {_single_line(witness.target)}{ensures_part} · '
+                    f'{label}={_single_line(json.dumps(value, sort_keys=True))} · '
+                    f'base={_single_line(json.dumps(witness.baseline, sort_keys=True))} · '
+                    f'head={_single_line(json.dumps(witness.candidate, sort_keys=True))}'
+                )
 
     if not args.json:
         _emit_github_annotations(res, mode)

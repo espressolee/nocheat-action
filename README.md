@@ -25,7 +25,7 @@ When the same family of LLMs writes code, fixes failing CI checks, reviews diffs
   with:
     fetch-depth: 0
 
-- uses: espressolee/nocheat-action@v0.1.6
+- uses: espressolee/nocheat-action@v0.1.7
   with:
     mode: observe   # report only (exit 0) and write findings to $GITHUB_STEP_SUMMARY
 ```
