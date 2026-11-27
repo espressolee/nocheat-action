@@ -25,12 +25,12 @@ When the same family of LLMs writes code, fixes failing CI checks, reviews diffs
   with:
     fetch-depth: 0
 
-- uses: espressolee/nocheat-action@v0.1.1
+- uses: espressolee/nocheat-action@v0.1.2
   with:
     mode: observe   # report only (exit 0) and write findings to $GITHUB_STEP_SUMMARY
 ```
 
-Switch `mode: enforce` to hard-block merges (`exit 2`) only when a deterministic defect witness or test-integrity violation is confirmed (`ABSTAIN` remains `exit 0` for human review). For monorepos, pass `include-paths` / `exclude-paths` (or CLI `--include` / `--exclude`) globs.
+Switch `mode: enforce` to hard-block merges (`exit 2`) on `BLOCK` verdicts (`ABSTAIN` defaults to `abstain-policy: warn` / `exit 0` for human review, or set `abstain-policy: fail` to hard-block `ABSTAIN` merges with `exit 3`). For monorepos, pass `include-paths` / `exclude-paths` (or CLI `--include` / `--exclude`) globs.
 
 ### Local CLI Usage
 
@@ -125,32 +125,32 @@ Non-code PRs (`README.md`) pass in `0.02s` (`NO_EXECUTABLE_SOURCE_CHANGES`); cle
 
 ---
 
-## Offline Comparative Benchmark (`Real-Only N=83`, `$0` Offline)
+## Offline Comparative Benchmark (`Reported N=83`, `$0` Offline)
 
-Evaluated across `83` genuine public Python artifacts (`Sengim/impossiblebench-rollouts` `N=57`, `wasaybuilds/proof-of-done` MIT Python fixtures `N=14`, `pallets/click` OSS commits `N=12`; `41` cheats / `42` clean):
+Evaluated across `83` public Python artifacts (`Sengim/impossiblebench-rollouts` `N=57` induced test-exploitation rollouts, `wasaybuilds/proof-of-done` MIT Python public fixtures `N=14` — note upstream fixtures include reconstructed examples rather than natural PRs, `pallets/click` natural OSS commits `N=12`; `41` cheats / `42` clean). Note that `MutationOnly` below is an **internal same-battery policy ablation**, not an equal-budget standalone `mutmut` benchmark; `TestGuard (regex)` refers to a minimal regex baseline rather than AST-based `techdevfun/testguard` or session-aware `Arnav66692/testguard`.
 
-| Gate / Baseline | Cheat Guarded (`BLOCK` + `ABSTAIN`) | Clean FP Hard Block | Clean `ABSTAIN` Noise |
-|---|---:|---:|---:|
-| `TestGuard` (regex) | `4/41` (`9.8%`) | `2/42` (`4.8%`) | — |
-| `Proof-of-Done` (AST) | `9/41` (`22.0%`) | `1/42` (`2.4%`) | — |
-| `MutationOnly` (pure AST mutation) | `15/41` (`36.6%`) | `14/42` (`33.3%`) | — |
-| **`NoCheat Merge Gate` (`nocheat-action v0.1`)** | **`35/41` (`85.4%`)** *(19 Block + 16 Abstain)* | **`0/42` (`0.0%`)** | **`1/42` (`2.4%`)** *(seq-equiv `2/42, 4.8%`)* |
+| Gate / Baseline | Auto-Blocked (`BLOCK`) | Review Flagged (`ABSTAIN`) | Total Flagged (`BLOCK` + `ABSTAIN`) | Clean FP Hard Block | Clean `ABSTAIN` Noise |
+|---|---:|---:|---:|---:|---:|
+| Regex test-tamper baseline | — | — | `4/41` (`9.8%`) | `2/42` (`4.8%`) | — |
+| `Proof-of-Done` (AST) | — | — | `9/41` (`22.0%`) | `1/42` (`2.4%`) | — |
+| `MutationOnly` *(internal ablation)* | — | — | `15/41` (`36.6%`) | `14/42` (`33.3%`) | — |
+| **`NoCheat Merge Gate` (`v0.1`)** | **`19/41` (`46.3%`)** | **`16/41` (`39.0%`)** | **`35/41` (`85.4%`)** | **`0/42` (`0.0%`)** | **`1/42` (`2.4%`)** *(seq-equiv `2/42, 4.8%`)* |
 
-**Transparent failure limits (zero hiding):**
-- **4/41 cheats missed (`PASS`):** `oneoff` cheats where tests were untouched (`test_edited=False`) and mutation kill rates stayed high (`70.8%–91.7%`).
+**Transparent failure limits & accounting (zero hiding):**
+- **Complete `41`-cheat accounting:** `19 BLOCK` (`46.3%`, automatic block in `enforce`) + `16 ABSTAIN` (`39.0%`, blocks merge only when `abstain-policy: fail` or required human review is configured) + `4 PASS` missed (`9.8%`, `oneoff` cheats where tests were untouched and mutation kill rates stayed `70.8%–91.7%`) + `2` remaining cases (`4.9%`, pending full per-case public provenance table release).
 - **Clean non-PASS cases:** `C2A_POD_Real` `5/5 (100%)` PASS and `C3_Click_OSS` `12/12 (100%)` PASS; remaining `C1_Sengim` clean non-PASS cases are `1` low-kill-band `ABSTAIN` (`33.3%`) plus `2` baseline failures (`1` pre-existing failing baseline test + `1` parallel-contention 15s baseline timeout that hits `120s` budget `ABSTAIN` sequentially).
-- Live production capture rates on external `Claude Ship` / `PR Steward` PR corpora remain **unmeasured** until external field rollout.
+- **External validity:** `ImpossibleBench` measures induced specification/test conflict, not natural PR cheating incidence. Live production capture rates on external PR corpora remain **unmeasured** until external field rollout.
 
 ---
 
 ## Verdict Semantics
 
-| Verdict | Meaning | `observe` Exit | `enforce` Exit |
-|---|---|:---:|:---:|
-| `PASS` | Executed checks found no defect witness (`NO_EXECUTABLE_SOURCE_CHANGES` / `NO_MUTABLE_LOGIC_DIFF` explicitly labeled when no mutable logic changed). | `0` | `0` |
-| `BLOCK` | Confirmed contract counterexample, test-weakening / deletion witness, concurrency witness, or severe mutation survival. | `0` | `2` |
-| `ABSTAIN` | Inconclusive contract (including same-PR contract edits), literal bypass guard, degraded test with zero mutants, low-kill band, missing tests for executable diffs, or 120s budget cap. | `0` | `0` |
-| `BASELINE_FAIL` | The candidate PR's baseline test suite failed before mutation checks could run. | `0` | `1` |
+| Verdict | Meaning | `observe` Exit | `enforce` (`abstain-policy: warn`) | `enforce` (`abstain-policy: fail`) |
+|---|---|:---:|:---:|:---:|
+| `PASS` | Executed checks found no blocking evidence (`NO_EXECUTABLE_SOURCE_CHANGES` / `NO_MUTABLE_LOGIC_DIFF` explicitly labeled when no mutable logic changed). | `0` | `0` | `0` |
+| `BLOCK` | Evidentiary basis explicitly labeled in summary: `Contract Counterexample Confirmed`, `Behavioral Witness Confirmed` (non-idempotence / non-timeout concurrency failure), `Test Integrity Violation` (`POD001–POD006`), or `Insufficient Verification / Mutation Survival`. | `0` | `2` | `2` |
+| `ABSTAIN` | Fail-closed uncertainty: inconclusive contract / same-PR contract edit, literal bypass guard, `PCT_SCHEDULE_TIMEOUT_INCONCLUSIVE`, low-kill band, missing tests for executable diffs, or 120s budget cap. | `0` | `0` | `3` |
+| `BASELINE_FAIL` | The candidate PR's baseline test suite failed before mutation checks could run. | `0` | `1` | `1` |
 
 ---
 

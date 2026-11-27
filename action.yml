@@ -4,9 +4,13 @@ author: 'NoCheat'
 
 inputs:
   mode:
-    description: 'Operation mode: "observe" (shadow report only, exit 0) or "enforce" (exit 2 on confirmed BLOCK witness)'
+    description: 'Operation mode: "observe" (shadow report only, exit 0) or "enforce" (exit 2 on BLOCK, exit 1 on BASELINE_FAIL)'
     required: false
     default: 'observe'
+  abstain-policy:
+    description: 'How enforce mode exits on ABSTAIN: "warn" (exit 0, human review recommended) or "fail" (exit 3, hard-block merge)'
+    required: false
+    default: 'warn'
   repo:
     description: 'Repository path to evaluate (defaults to GITHUB_WORKSPACE)'
     required: false
@@ -56,6 +60,7 @@ runs:
       env:
         NOCHEAT_RUNTIME_ROOT: ${{ github.action_path }}
         INPUT_MODE: ${{ inputs.mode }}
+        INPUT_ABSTAIN_POLICY: ${{ inputs.abstain-policy }}
         INPUT_REPO: ${{ inputs.repo }}
         INPUT_BASE: ${{ inputs.base-ref }}
         INPUT_HEAD: ${{ inputs.head-ref }}
@@ -103,6 +108,9 @@ runs:
         fi
 
         EXTRA_ARGS=()
+        if [ -n "${INPUT_ABSTAIN_POLICY:-}" ]; then
+          EXTRA_ARGS+=(--abstain-policy "$INPUT_ABSTAIN_POLICY")
+        fi
         if [ "$INPUT_JSON" = "true" ]; then
           EXTRA_ARGS+=(--json)
         fi

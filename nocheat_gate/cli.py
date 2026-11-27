@@ -46,6 +46,7 @@ _ABSTAIN_ACTIONS = {
     'MUTANT_RUNNER_UNAVAILABLE': 'Repair the test runner and dependencies before interpreting the mutation score.',
     'MUTANT_TIMEOUT_CAUSE_UNKNOWN': 'Leave more time between the individual timeout and the overall evaluation deadline.',
     'CONCURRENCY_RUNNER_UNSUPPORTED': 'Use the built-in runner for this concurrency change, or run the concurrency checks separately.',
+    'PCT_SCHEDULE_TIMEOUT_INCONCLUSIVE': 'A scheduled concurrency check hit its per-schedule timeout; inspect for slow fixtures or deadlocks rather than assuming a race.',
     'LOW_KILL_BAND_REVIEW': 'Add assertions that distinguish the surviving changes shown below.',
     'ZERO_MUTABLE_AST_NODES': 'Review the changed behavior directly and add a targeted regression test.',
     'ZERO_MUTABLE_AST_NODES_WITH_DEGRADED_TEST': 'Restore the removed test coverage and verify the changed behavior.',
@@ -122,18 +123,30 @@ def _probe_label(probe: ProbeExecution) -> str:
     return f'{probe.status} ({_single_line(probe.reason)})'
 
 
+def _block_basis_label(reasons: tuple[str, ...]) -> str:
+    """Classify the concrete evidentiary basis behind a BLOCK verdict without overstating."""
+    if any("CONTRACT_COUNTEREXAMPLE" in r for r in reasons):
+        return "Contract Counterexample Confirmed"
+    if any("CONCURRENCY_RACE_WITNESS" in r or "STATEFUL_NON_IDEMPOTENT" in r for r in reasons):
+        return "Behavioral Witness Confirmed"
+    if any(r.startswith("[POD") for r in reasons):
+        return "Test Integrity Violation"
+    return "Insufficient Verification / Mutation Survival"
+
+
 def render_markdown_summary(res: GateResult, mode: str) -> str:
     """Render structured GitHub Step Summary markdown."""
     if res.verdict == "PASS" and any(r in _NON_MUTABLE_PASS_REASONS for r in res.reasons):
         status_badge = "✅ PASS (No Mutable Logic Diff)"
     else:
+        block_basis = _block_basis_label(res.reasons) if res.verdict == "BLOCK" else ""
         status_badge = {
             "PASS": "✅ PASS",
             "ABSTAIN": "⚠️ ABSTAIN (Senior Review Recommended)",
             "BLOCK": (
-                "🛑 BLOCK (Defect Witness Confirmed)"
+                f"🛑 BLOCK ({block_basis})"
                 if mode == "enforce"
-                else "🔍 WITNESS FOUND (Observation Mode)"
+                else f"🔍 BLOCK SIGNAL ({block_basis}, Observation Mode)"
             ),
             "BASELINE_FAIL": "❌ BASELINE_FAIL",
         }.get(res.verdict, res.verdict)
@@ -398,7 +411,13 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         "--mode",
         choices=["observe", "enforce"],
         default="observe",
-        help="Operation mode: 'observe' (report only, never fail CI) or 'enforce' (hard block on confirmed defect)",
+        help="Operation mode: 'observe' (report only, never fail CI) or 'enforce' (fail on BLOCK/BASELINE_FAIL)",
+    )
+    parser.add_argument(
+        "--abstain-policy",
+        choices=["warn", "fail"],
+        default="warn",
+        help="How enforce mode exits on ABSTAIN: 'warn' (exit 0, default) or 'fail' (exit 3, hard-block merge)",
     )
     parser.add_argument(
         "--json",
@@ -555,6 +574,8 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         return 2
     if res.verdict == "BASELINE_FAIL":
         return 1
+    if res.verdict == "ABSTAIN" and args.abstain_policy == "fail":
+        return 3
     return 0
 
 

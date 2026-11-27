@@ -204,7 +204,7 @@ def test_pr3_ai_shortcut_blocked_while_pytest_is_green(tmp_path: Path):
     )
     assert rc_observe == 0
     md = summary_file.read_text(encoding="utf-8")
-    assert "WITNESS FOUND (Observation Mode)" in md
+    assert "BLOCK SIGNAL (Contract Counterexample Confirmed, Observation Mode)" in md
     assert "CONTRACT_COUNTEREXAMPLE: billing:charge" in md
 
     rc_enforce = main(["--repo", str(r3), "--base", "main", "--head", "HEAD", "--mode", "enforce"])
@@ -268,7 +268,14 @@ def test_ts_js_diff_fails_closed_in_python_first_slice(tmp_path: Path):
     _git(repo, "add", "app.ts")
     _git(repo, "commit", "-m", "edit ts")
 
-    res = evaluate_nocheat_gate(repo, "main", "HEAD")
+    from nocheat_gate.adapters.python_oracle import default_oracle_registry
+
+    res = evaluate_nocheat_gate(
+        repo,
+        "main",
+        "HEAD",
+        oracle_registry=default_oracle_registry(load_plugins=False),
+    )
     assert res.verdict == "ABSTAIN"
     assert any("TS_RUNTIME_UNAVAILABLE" in r for r in res.reasons)
 

@@ -638,7 +638,7 @@ def _run_one_pct_schedule(
     est_steps: int,
     timeout_s: float,
     env: dict[str, str],
-) -> tuple[bool, bool, int, str]:
+) -> tuple[str, bool, int, str]:
     payload = {
         "runner_mode": runner_mode,
         "targets": targets,
@@ -660,7 +660,12 @@ def _run_one_pct_schedule(
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired:
-        return False, True, est_steps, f"PCT_DEADLOCK_OR_TIMEOUT(mode={mode},d={bug_depth},seed={seed})"
+        return (
+            "timeout",
+            False,
+            est_steps,
+            f"PCT_SCHEDULE_TIMEOUT_INCONCLUSIVE(mode={mode},d={bug_depth},seed={seed})",
+        )
 
     concurrent_obs = False
     obs_steps = est_steps
@@ -674,9 +679,9 @@ def _run_one_pct_schedule(
             except json.JSONDecodeError:
                 pass
             break
-    passed = proc.returncode == 0
+    status = "passed" if proc.returncode == 0 else "failed"
     detail = (proc.stderr or proc.stdout).strip()[-350:]
-    return passed, concurrent_obs, obs_steps, detail
+    return status, concurrent_obs, obs_steps, detail
 
 
 def run_concurrency_pct_gate(
@@ -735,11 +740,12 @@ def run_concurrency_pct_gate(
     runs = 0
     concurrent_observed = False
     est_steps = 24
+    timeout_reason: str | None = None
     for depth, seed, rev in schedule_plan:
         if time.monotonic() - t0 >= total_pct_budget_s:
             break
         runs += 1
-        passed, conc_obs, obs_steps, detail = _run_one_pct_schedule(
+        status, conc_obs, obs_steps, detail = _run_one_pct_schedule(
             worktree,
             runner_mode,
             targets,
@@ -755,7 +761,7 @@ def run_concurrency_pct_gate(
         if runs == 1 and obs_steps > 0:
             est_steps = max(4, obs_steps)
         concurrent_observed = concurrent_observed or conc_obs
-        if not passed:
+        if status == "failed":
             return ConcurrencyGateReport(
                 triggered=True,
                 verdict="BLOCK",
@@ -772,6 +778,24 @@ def run_concurrency_pct_gate(
                 ),
                 elapsed_s=time.monotonic() - t0,
             )
+        if status == "timeout" and timeout_reason is None:
+            timeout_reason = detail
+
+    if timeout_reason is not None:
+        return ConcurrencyGateReport(
+            triggered=True,
+            verdict="ABSTAIN",
+            mode=mode,
+            fifo_passed=True,
+            pct_caught=False,
+            pct_mode=mode,
+            pct_seed=None,
+            pct_bug_depth=None,
+            schedules_run=runs,
+            concurrent_observed=concurrent_observed,
+            reasons=(timeout_reason,),
+            elapsed_s=time.monotonic() - t0,
+        )
 
     if analysis.unguarded_shared_writes and not concurrent_observed:
         sample = ", ".join(analysis.unguarded_shared_writes[:3])
