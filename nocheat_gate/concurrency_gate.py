@@ -743,7 +743,24 @@ sys.exit(rc)
 _HARNESS_DIGEST = hashlib.sha256(_PCT_HARNESS.encode("utf-8")).hexdigest()[:16]
 _FAILED_NODE_RE = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
 _EXC_TYPE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))\b")
+_PYTEST_LOC_RE = re.compile(r"^([^\s:]+\.py:\d+):\s+(?:in\s+\S+|[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))", re.MULTILINE)
+_TRACEBACK_LOC_RE = re.compile(r'File "([^"]+\.py)", line (\d+)')
 _RUNNER_ERR_TYPES = frozenset({"ImportError", "ModuleNotFoundError", "SyntaxError", "IndentationError"})
+
+
+def _extract_failing_location(combined: str) -> str | None:
+    """Extract repo-relative `<file>:<line>` of the failing assertion/exception (excluding stdlib/pytest)."""
+    locs: list[str] = []
+    for m in _PYTEST_LOC_RE.finditer(combined):
+        raw = m.group(1)
+        if "site-packages" not in raw and "lib/python" not in raw:
+            locs.append(f"{Path(raw.rsplit(':', 1)[0]).name}:{raw.rsplit(':', 1)[1]}")
+    if not locs:
+        for m in _TRACEBACK_LOC_RE.finditer(combined):
+            fpath, lno = m.group(1), m.group(2)
+            if "site-packages" not in fpath and "lib/python" not in fpath and "<string>" not in fpath:
+                locs.append(f"{Path(fpath).name}:{lno}")
+    return locs[-1] if locs else None
 
 
 def _resolve_git_binding(repo_dir: Path, head_ref: str) -> tuple[str | None, str | None]:
@@ -769,13 +786,14 @@ def _resolve_git_binding(repo_dir: Path, head_ref: str) -> tuple[str | None, str
 
 
 def _extract_witness_signature(returncode: int, runner_mode: str, stdout: str, stderr: str) -> dict:
-    """Extract structured witness kind, exception type, and failing test node; separate runner/import errors."""
+    """Extract structured witness kind, exception type, failing test node, and failure location."""
     combined = f"{stdout}\n{stderr}"
     if "PCT_WITNESS:LOCK_ORDER_CYCLE" in combined:
         return {
             "witness_kind": "deadlock",
             "exception_type": "LOCK_ORDER_CYCLE",
             "failing_test": None,
+            "failing_location": None,
             "returncode": returncode,
         }
     if returncode == 0:
@@ -783,10 +801,12 @@ def _extract_witness_signature(returncode: int, runner_mode: str, stdout: str, s
             "witness_kind": "none",
             "exception_type": None,
             "failing_test": None,
+            "failing_location": None,
             "returncode": 0,
         }
     failed_m = _FAILED_NODE_RE.search(combined)
     failing_test = failed_m.group(1) if failed_m else None
+    failing_location = _extract_failing_location(combined)
     exc_matches = _EXC_TYPE_RE.findall(combined)
     exc_type = exc_matches[-1] if exc_matches else None
 
@@ -795,6 +815,7 @@ def _extract_witness_signature(returncode: int, runner_mode: str, stdout: str, s
             "witness_kind": "runner_error",
             "exception_type": exc_type or f"PYTEST_EXIT_{returncode}",
             "failing_test": failing_test,
+            "failing_location": failing_location,
             "returncode": returncode,
         }
     if exc_type == "AssertionError" or "assert " in combined or "AssertionError" in combined:
@@ -802,12 +823,14 @@ def _extract_witness_signature(returncode: int, runner_mode: str, stdout: str, s
             "witness_kind": "assertion",
             "exception_type": "AssertionError",
             "failing_test": failing_test,
+            "failing_location": failing_location,
             "returncode": returncode,
         }
     return {
         "witness_kind": "runtime_exception",
         "exception_type": exc_type or f"EXIT_{returncode}",
         "failing_test": failing_test,
+        "failing_location": failing_location,
         "returncode": returncode,
     }
 
@@ -820,6 +843,8 @@ def _witness_matches(expected: dict | None, actual: dict) -> bool:
     if expected.get("exception_type") and actual.get("exception_type") != expected.get("exception_type"):
         return False
     if expected.get("failing_test") and actual.get("failing_test") != expected.get("failing_test"):
+        return False
+    if expected.get("failing_location") and actual.get("failing_location") != expected.get("failing_location"):
         return False
     return True
 
@@ -1223,6 +1248,7 @@ def replay_concurrency_trace(
     status = run_res["status"]
     divergence = run_res["replay_divergence"]
     consumed = int(run_res["replay_cursor"])
+    rerun_complete = bool(run_res.get("trace_complete", False)) and not bool(run_res.get("trace_truncated", False))
     exact_events_match = (
         divergence is None
         and consumed == len(recorded_events)
@@ -1235,10 +1261,12 @@ def replay_concurrency_trace(
         "concurrent_observed": bool(run_res["concurrent_observed"]),
         "observed_steps": int(run_res["observed_steps"]),
         "schedule_events": list(run_res["schedule_events"]),
+        "rerun_trace_complete": rerun_complete,
+        "rerun_trace_truncated": bool(run_res.get("trace_truncated", False)),
         "replay_divergence": divergence or (
             None if exact_events_match else f"consumed={consumed}/{len(recorded_events)}"
         ),
-        "schedule_enforced": bool(exact_events_match),
+        "schedule_enforced": bool(exact_events_match and rerun_complete),
         "witness_signature": run_res["witness_signature"],
         "witness_matched": bool(witness_ok),
         "detail": str(run_res["detail"]),
@@ -1246,6 +1274,8 @@ def replay_concurrency_trace(
 
     if status == "timeout":
         base_resp["status"] = "TIMEOUT"
+    elif not rerun_complete:
+        base_resp["status"] = "TRACE_INCOMPLETE"
     elif not exact_events_match:
         base_resp["status"] = "TRACE_DIVERGED"
     elif status == "passed":

@@ -295,6 +295,49 @@ def test_deterministic_concurrency_trace_and_replay_cli(tmp_path: Path, capsys):
     assert exc_info.value.code == 2
     assert capsys.readouterr().out.strip() == ""
 
+    # Negative Counterexample 7: Re-execution itself is truncated -> TRACE_INCOMPLETE (never REPRODUCED)
+    with patch(
+        "nocheat_gate.concurrency_gate._run_one_pct_schedule",
+        return_value={
+            "status": "failed",
+            "concurrent_observed": True,
+            "observed_steps": len(res.concurrency_trace["schedule_events"]),
+            "detail": "AssertionError",
+            "schedule_events": list(res.concurrency_trace["schedule_events"]),
+            "trace_complete": False,
+            "trace_truncated": True,
+            "replay_cursor": len(res.concurrency_trace["schedule_events"]),
+            "replay_divergence": None,
+            "witness_signature": dict(res.concurrency_trace["witness_signature"]),
+        },
+    ):
+        rep_rerun_trunc = replay_concurrency_trace(repo, "HEAD", res.concurrency_trace)
+    assert rep_rerun_trunc["status"] == "TRACE_INCOMPLETE", rep_rerun_trunc
+    assert rep_rerun_trunc["rerun_trace_complete"] is False
+
+    # Negative Counterexample 8: Same test function failing on a DIFFERENT assertion line -> WITNESS_MISMATCH
+    orig_sig = res.concurrency_trace["witness_signature"]
+    assert orig_sig.get("failing_location") is not None
+    diff_loc_sig = dict(orig_sig, failing_location="test_vault.py:999")
+    with patch(
+        "nocheat_gate.concurrency_gate._run_one_pct_schedule",
+        return_value={
+            "status": "failed",
+            "concurrent_observed": True,
+            "observed_steps": len(res.concurrency_trace["schedule_events"]),
+            "detail": "AssertionError at line 999",
+            "schedule_events": list(res.concurrency_trace["schedule_events"]),
+            "trace_complete": True,
+            "trace_truncated": False,
+            "replay_cursor": len(res.concurrency_trace["schedule_events"]),
+            "replay_divergence": None,
+            "witness_signature": diff_loc_sig,
+        },
+    ):
+        rep_diff_loc = replay_concurrency_trace(repo, "HEAD", res.concurrency_trace)
+    assert rep_diff_loc["status"] == "WITNESS_MISMATCH", rep_diff_loc
+    assert rep_diff_loc["witness_matched"] is False
+
 
 def test_ts_js_monorepo_subpackage_vitest_single_quote_node_test_and_missing_runner_abstain(tmp_path: Path):
     from nocheat_gate.diff_scope import DiffScope, FileDiffSummary
