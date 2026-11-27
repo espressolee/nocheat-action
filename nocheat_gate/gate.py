@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 import time
 
-from .adapters.base import OracleRegistry
+from .adapters.base import LanguageAnalysisResult, LanguagePack, OracleRegistry, TestExecutionPlan
 from .adapters.python_oracle import default_oracle_registry
 from .adapters.ts_js import TsRuntimeUnavailable
 from .concurrency_gate import ConcurrencyGateReport, run_concurrency_pct_gate
@@ -19,11 +19,13 @@ from .mutator import (
     cap_mutants_round_robin,
 )
 from .runner import (
+    ExecutionOutcome,
     MutantBatteryReport,
     PytestDiscoveryError,
     _build_env,
     check_docstring_contracts,
     check_in_process_idempotence,
+    prepare_ts_js_workspace,
     run_mutant_battery,
     run_test_command,
     select_test_runner,
@@ -31,6 +33,49 @@ from .runner import (
     temporary_snapshot,
 )
 from .tier0_syntax import Tier0Finding
+
+_VERDICT_RANK = {"PASS": 0, "ABSTAIN": 1, "BASELINE_FAIL": 2, "BLOCK": 3}
+_PASS_ONLY_REASONS = frozenset({
+    "ZERO_COMMENT_PASS",
+    "ALL_DIFF_MUTANTS_KILLED",
+    "NO_EXECUTABLE_SOURCE_CHANGES",
+    "NO_MUTABLE_LOGIC_DIFF",
+})
+
+
+def _join_verdict(a: str, b: str) -> str:
+    return a if _VERDICT_RANK.get(a, 0) >= _VERDICT_RANK.get(b, 0) else b
+
+
+def _allocate_mutant_budgets(
+    oracle_results: tuple[LanguageAnalysisResult, ...],
+    max_mutants: int,
+) -> dict[str, list[MutantCandidate]]:
+    """Allocate `max_mutants` fairly across all active languages without starvation."""
+    with_mutants = [ores for ores in oracle_results if ores.mutants]
+    if not with_mutants:
+        return {ores.language: [] for ores in oracle_results}
+    if len(with_mutants) == 1:
+        only = with_mutants[0]
+        return {
+            ores.language: (
+                cap_mutants_round_robin(list(only.mutants), max_mutants=max_mutants)
+                if ores.language == only.language
+                else []
+            )
+            for ores in oracle_results
+        }
+    base_q, rem = divmod(max(len(with_mutants), max_mutants), len(with_mutants))
+    alloc: dict[str, list[MutantCandidate]] = {}
+    m_idx = 0
+    for ores in oracle_results:
+        if not ores.mutants:
+            alloc[ores.language] = []
+            continue
+        cap = max(1, base_q + (1 if m_idx < rem else 0))
+        alloc[ores.language] = cap_mutants_round_robin(list(ores.mutants), max_mutants=cap)
+        m_idx += 1
+    return alloc
 
 
 @dataclass(frozen=True)
@@ -209,86 +254,129 @@ def _evaluate_pr_pair(
                       concurrency_execution=skipped)
         return GateResult(arm='MutationOnly', **common), GateResult(arm='NoCheatGate', **common)
 
-    raw_mutants: list[MutantCandidate] = []
-    literal_guards: list[LiteralGuardHit] = []
-    tier0_list: list[Tier0Finding] = []
-    combined_prod_scopes_list = []
-    combined_fallback_scopes_list = []
-    test_degraded = False
-
-    for res in oracle_results:
-        raw_mutants.extend(res.mutants)
-        literal_guards.extend(res.literal_guards)
-        tier0_list.extend(res.tier0_findings)
-        combined_prod_scopes_list.extend(res.prod_scopes)
-        combined_fallback_scopes_list.extend(res.callee_fallback_scopes)
-        test_degraded = test_degraded or res.test_degraded
-
-    mutants = cap_mutants_round_robin(raw_mutants, max_mutants=max_mutants)
-    tier0_findings = tuple(tier0_list)
-    combined_prod_scopes = tuple(combined_prod_scopes_list) or scope.prod_scopes
-    combined_fallback_scopes = tuple(combined_fallback_scopes_list) or scope.callee_fallback_scopes
-    if not scope.issues and not any(f.rel_path.endswith('.py') for f in (*scope.prod_files, *scope.test_files)):
-        test_cmd = None
-
-    with temporary_checkout(repo_dir, head_ref) as worktree:
-        no_target_reasons = ('NO_TEST_TARGETS_SELECTED',)
-        source_issues = scope.issues + source_module_collisions(
-            worktree, (item.rel_path for item in (*scope.prod_files, *scope.callee_fallback_scopes)),
-        )
-        if source_issues:
-            runner_mode, targets = ('custom' if test_cmd is not None else 'pytest'), []
-            no_target_reasons = source_issues
-        elif test_cmd is not None:
-            runner_mode, targets = 'custom', []
-        else:
-            try:
-                runner_mode, targets = select_test_runner(
-                    worktree, scope.test_files, scope.prod_files,
-                    combined_prod_scopes or combined_fallback_scopes,
-                    pytest_python_files=scope.pytest_python_files,
-                    pytest_testpaths=scope.pytest_testpaths,
-                )
-            except PytestDiscoveryError as exc:
-                runner_mode, targets = 'pytest', []
-                no_target_reasons = (str(exc),)
-        if not targets and (test_cmd is None or source_issues):
-            elapsed = time.monotonic() - t0
-            has_executable_diff = bool(
-                scope.prod_files
-                or scope.test_files
-                or source_issues
-                or mutants
-                or tier0_findings
-                or literal_guards
+    if not oracle_results:
+        elapsed = time.monotonic() - t0
+        if scope.issues:
+            skipped = ProbeExecution('SKIPPED', scope.issues[0].split(':', 1)[0])
+            ab = dict(
+                verdict="ABSTAIN",
+                reasons=scope.issues,
+                total_mutants=0,
+                run_mutants=0,
+                killed_mutants=0,
+                survived_mutants=0,
+                kill_rate=0.0,
+                idempotent=True,
+                literal_guards=(),
+                tier0_findings=(),
+                runner_mode="pytest",
+                targets=(),
+                elapsed_s=elapsed,
+                idempotence_execution=skipped,
+                concurrency_execution=skipped,
             )
-            if not has_executable_diff:
-                na_common = dict(
-                    verdict="PASS",
-                    reasons=("NO_EXECUTABLE_SOURCE_CHANGES",),
-                    total_mutants=0,
-                    run_mutants=0,
-                    killed_mutants=0,
-                    survived_mutants=0,
-                    kill_rate=0.0,
-                    idempotent=True,
-                    literal_guards=(),
-                    tier0_findings=(),
-                    runner_mode=runner_mode,
-                    targets=(),
-                    elapsed_s=elapsed,
-                    idempotence_execution=ProbeExecution('SKIPPED', 'NO_EXECUTABLE_SOURCE_CHANGES'),
-                    concurrency_execution=ProbeExecution('SKIPPED', 'NO_EXECUTABLE_SOURCE_CHANGES'),
+            return GateResult(arm="MutationOnly", **ab), GateResult(arm="NoCheatGate", **ab)
+        na_common = dict(
+            verdict="PASS",
+            reasons=("NO_EXECUTABLE_SOURCE_CHANGES",),
+            total_mutants=0,
+            run_mutants=0,
+            killed_mutants=0,
+            survived_mutants=0,
+            kill_rate=0.0,
+            idempotent=True,
+            literal_guards=(),
+            tier0_findings=(),
+            runner_mode="pytest",
+            targets=(),
+            elapsed_s=elapsed,
+            idempotence_execution=ProbeExecution('SKIPPED', 'NO_EXECUTABLE_SOURCE_CHANGES'),
+            concurrency_execution=ProbeExecution('SKIPPED', 'NO_EXECUTABLE_SOURCE_CHANGES'),
+        )
+        return (
+            GateResult(arm="MutationOnly", **na_common),
+            GateResult(arm="NoCheatGate", **na_common),
+        )
+
+    lang_mutant_alloc = _allocate_mutant_budgets(oracle_results, max_mutants=max_mutants)
+    all_literal_guards = tuple(g for ores in oracle_results for g in ores.literal_guards)
+    all_tier0_findings = tuple(f for ores in oracle_results for f in ores.tier0_findings)
+
+    def _run_single_language(
+        worktree: Path,
+        ores: LanguageAnalysisResult,
+        lang_mutants: list[MutantCandidate],
+    ) -> tuple[GateResult, GateResult]:
+        pack = registry.get(ores.language)
+        lang_test_cmd = test_cmd if ores.language == "python" else None
+
+        if pack is not None and isinstance(pack, LanguagePack):
+            pack.prepare_workspace(repo_dir, worktree)
+            plan = pack.discover_tests(worktree, scope, ores, test_cmd=lang_test_cmd)
+            runner_mode = plan.runner_id
+            targets = list(plan.targets)
+            no_target_reasons = plan.issues if plan.issues else ('NO_TEST_TARGETS_SELECTED',)
+            builtin_runner = runner_mode in {"pytest", "script", "custom", "vitest", "jest", "node_test"}
+
+            def _exec_baseline(snap: Path, timeout_s: float) -> ExecutionOutcome:
+                if builtin_runner:
+                    return run_test_command(
+                        snap, runner_mode, targets, timeout_s=timeout_s, test_cmd=lang_test_cmd
+                    )
+                return pack.run_tests(snap, plan, timeout_s=timeout_s, test_cmd=lang_test_cmd)
+
+            mutant_run_fn = None if builtin_runner else (
+                lambda snap, timeout_s: pack.run_tests(snap, plan, timeout_s=timeout_s, test_cmd=lang_test_cmd)
+            )
+        else:
+            if ores.language == "ts_js":
+                prepare_ts_js_workspace(
+                    repo_dir,
+                    worktree,
+                    tuple(f.rel_path for f in (*scope.prod_files, *scope.test_files)),
                 )
-                return (
-                    GateResult(arm="MutationOnly", **na_common),
-                    GateResult(arm="NoCheatGate", **na_common),
+            no_target_reasons = ('NO_TEST_TARGETS_SELECTED',)
+            source_issues = scope.issues + (
+                source_module_collisions(
+                    worktree,
+                    (item.rel_path for item in (*scope.prod_files, *scope.callee_fallback_scopes)),
                 )
+                if ores.language == "python"
+                else ()
+            )
+            if source_issues:
+                runner_mode, targets = ('custom' if lang_test_cmd is not None else 'pytest'), []
+                no_target_reasons = source_issues
+            elif lang_test_cmd is not None:
+                runner_mode, targets = 'custom', []
+            else:
+                try:
+                    runner_mode, targets = select_test_runner(
+                        worktree,
+                        scope.test_files,
+                        scope.prod_files,
+                        ores.prod_scopes or ores.callee_fallback_scopes,
+                        pytest_python_files=scope.pytest_python_files,
+                        pytest_testpaths=scope.pytest_testpaths,
+                    )
+                except PytestDiscoveryError as exc:
+                    runner_mode, targets = 'pytest', []
+                    no_target_reasons = (str(exc),)
+
+            def _exec_baseline(snap: Path, timeout_s: float) -> ExecutionOutcome:
+                return run_test_command(
+                    snap, runner_mode, targets, timeout_s=timeout_s, test_cmd=lang_test_cmd
+                )
+
+            mutant_run_fn = None
+
+        if not targets and (lang_test_cmd is None or no_target_reasons != ('NO_TEST_TARGETS_SELECTED',)):
+            elapsed = time.monotonic() - t0
             base_fail_3 = GateResult(
                 arm="MutationOnly",
                 verdict="ABSTAIN",
                 reasons=no_target_reasons,
-                total_mutants=len(mutants),
+                total_mutants=len(lang_mutants),
                 run_mutants=0,
                 killed_mutants=0,
                 survived_mutants=0,
@@ -302,8 +390,7 @@ def _evaluate_pr_pair(
                 idempotence_execution=ProbeExecution('SKIPPED', no_target_reasons[0].split(':', 1)[0]),
                 concurrency_execution=ProbeExecution('SKIPPED', no_target_reasons[0].split(':', 1)[0]),
             )
-            # Tier 0 block (e.g. entire test file deleted!) still fires in Arm 4
-            t0_blocks = [f for f in tier0_findings if f.severity == "block"]
+            t0_blocks = [f for f in ores.tier0_findings if f.severity == "block"]
             arm4_verdict = "BLOCK" if t0_blocks else "ABSTAIN"
             arm4_reasons = tuple(f.message for f in t0_blocks) + (
                 no_target_reasons if not t0_blocks or no_target_reasons != ('NO_TEST_TARGETS_SELECTED',) else ()
@@ -312,14 +399,14 @@ def _evaluate_pr_pair(
                 arm="NoCheatGate",
                 verdict=arm4_verdict,
                 reasons=arm4_reasons,
-                total_mutants=len(mutants),
+                total_mutants=len(lang_mutants),
                 run_mutants=0,
                 killed_mutants=0,
                 survived_mutants=0,
                 kill_rate=0.0,
                 idempotent=True,
-                literal_guards=tuple(literal_guards),
-                tier0_findings=tier0_findings,
+                literal_guards=ores.literal_guards,
+                tier0_findings=ores.tier0_findings,
                 runner_mode=runner_mode,
                 targets=(),
                 elapsed_s=elapsed,
@@ -334,9 +421,7 @@ def _evaluate_pr_pair(
             else max(10.0, per_mutant_timeout_s * 3)
         )
         with temporary_snapshot(worktree) as baseline_tree:
-            baseline = run_test_command(
-                baseline_tree, runner_mode, targets, timeout_s=effective_baseline_timeout, test_cmd=test_cmd
-            )
+            baseline = _exec_baseline(baseline_tree, effective_baseline_timeout)
         if not baseline.passed:
             elapsed = time.monotonic() - t0
             msg = (f"BASELINE_TESTS_FAILED: rc={baseline.returncode} {baseline.output_tail[:200]}",)
@@ -346,7 +431,7 @@ def _evaluate_pr_pair(
                     verdict="BASELINE_FAIL",
                     reasons=msg,
                     baseline_execution=baseline.diagnosis,
-                    total_mutants=len(mutants),
+                    total_mutants=len(lang_mutants),
                     run_mutants=0,
                     killed_mutants=0,
                     survived_mutants=0,
@@ -363,168 +448,249 @@ def _evaluate_pr_pair(
                     verdict="BASELINE_FAIL",
                     reasons=msg,
                     baseline_execution=baseline.diagnosis,
-                    total_mutants=len(mutants),
+                    total_mutants=len(lang_mutants),
                     run_mutants=0,
                     killed_mutants=0,
                     survived_mutants=0,
                     kill_rate=0.0,
                     idempotent=True,
-                    literal_guards=tuple(literal_guards),
-                    tier0_findings=tier0_findings,
+                    literal_guards=ores.literal_guards,
+                    tier0_findings=ores.tier0_findings,
                     runner_mode=runner_mode,
                     targets=tuple(targets),
                     elapsed_s=elapsed,
                 ),
             )
 
-        py_prod_scopes = tuple(s for s in scope.prod_scopes if s.rel_path.endswith(".py"))
-        with temporary_snapshot(worktree) as probe_tree:
-            idempotent, idemp_msg = check_in_process_idempotence(
-                probe_tree, runner_mode, targets, timeout_s=max(10.0, baseline.elapsed_s * 4 + 2.0)
-            )
-            doctest_ok, doctest_msg = check_docstring_contracts(probe_tree, py_prod_scopes, timeout_s=4.0)
-            conc_report: ConcurrencyGateReport = run_concurrency_pct_gate(
-                probe_tree, repo_dir, head_ref,
-                py_prod_scopes or tuple(s for s in scope.callee_fallback_scopes if s.rel_path.endswith('.py')),
-                scope.prod_files, runner_mode, targets,
-                test_files=scope.test_files, env=_build_env(probe_tree),
-            )
-        if runner_mode in {"vitest", "jest", "node_test"}:
-            active_mutants = [m for m in mutants if not m.rel_path.endswith(".py")]
+        if ores.language == "python":
+            py_prod_scopes = tuple(s for s in scope.prod_scopes if s.rel_path.endswith(".py"))
+            with temporary_snapshot(worktree) as probe_tree:
+                idempotent, idemp_msg = check_in_process_idempotence(
+                    probe_tree, runner_mode, targets, timeout_s=max(10.0, baseline.elapsed_s * 4 + 2.0)
+                )
+                doctest_ok, doctest_msg = check_docstring_contracts(probe_tree, py_prod_scopes, timeout_s=4.0)
+                conc_report: ConcurrencyGateReport = run_concurrency_pct_gate(
+                    probe_tree, repo_dir, head_ref,
+                    py_prod_scopes or tuple(s for s in scope.callee_fallback_scopes if s.rel_path.endswith('.py')),
+                    scope.prod_files, runner_mode, targets,
+                    test_files=scope.test_files, env=_build_env(probe_tree),
+                )
         else:
-            active_mutants = [m for m in mutants if m.rel_path.endswith(".py")]
+            idempotent, idemp_msg = True, "IDEMPOTENCE_SKIPPED_OR_SCRIPT_ONLY"
+            doctest_ok, doctest_msg = True, "NO_PROD_SCOPES"
+            conc_report = ConcurrencyGateReport(
+                triggered=False,
+                verdict="PASS",
+                mode="none",
+                fifo_passed=True,
+                pct_caught=False,
+                pct_mode="none",
+                pct_seed=None,
+                pct_bug_depth=None,
+                schedules_run=0,
+                concurrent_observed=False,
+                reasons=(),
+                elapsed_s=0.0,
+                skip_reason="NON_PYTHON_LANGUAGE_PACK",
+            )
+
         battery = run_mutant_battery(
             worktree,
-            active_mutants,
+            lang_mutants,
             runner_mode,
             targets,
             per_mutant_timeout_s=max(per_mutant_timeout_s, baseline.elapsed_s * 3 + 2.0),
             total_budget_s=total_budget_s,
             started_at=t0,
-            test_cmd=test_cmd,
+            test_cmd=lang_test_cmd,
+            run_fn=mutant_run_fn,
         )
 
-    total_elapsed = time.monotonic() - t0
-    if idemp_msg in {'CUSTOM_TEST_COMMAND', 'IDEMPOTENCE_SKIPPED_OR_SCRIPT_ONLY'}:
-        idempotence_execution = ProbeExecution('SKIPPED', idemp_msg)
-    elif idemp_msg in {'IDEMPOTENCE_TIMEOUT_INCONCLUSIVE', 'IDEMPOTENCE_LAUNCH_UNAVAILABLE'}:
-        idempotence_execution = ProbeExecution('INCONCLUSIVE', idemp_msg)
-    else:
-        idempotence_execution = ProbeExecution('PASSED' if idempotent else 'FAILED', idemp_msg)
-    if conc_report.skip_reason:
-        concurrency_execution = ProbeExecution('SKIPPED', conc_report.skip_reason)
-    elif not conc_report.schedules_run:
-        concurrency_execution = ProbeExecution('INCONCLUSIVE', 'NO_CONCURRENCY_SCHEDULE_EXECUTED')
-    else:
-        concurrency_execution = ProbeExecution(
-            {'PASS': 'PASSED', 'ABSTAIN': 'INCONCLUSIVE', 'BLOCK': 'FAILED'}[conc_report.verdict],
-            next(iter(conc_report.reasons), 'CONCURRENCY_SCHEDULES_OBSERVED'),
-        )
-    mutation_execution = {
-        'mutant_runner_unavailable': battery.unavailable_mutants,
-        'mutant_timeout_kills': sum(result.status == 'KILLED_TIMEOUT' for result in battery.results),
-        'mutant_budget_unscored': battery.budget_unscored_mutants,
-        'mutant_unknown_timeouts': battery.unknown_timeout_mutants,
-    }
-    survivors = tuple(
-        SurvivingMutant(m.rel_path, m.lineno if m.lineno and m.lineno > 0 else None, m.desc, m.diff_line)
-        for m in (result.mutant for result in battery.results if result.status == 'SURVIVED')
-    )
-    mut_verdict, mut_reasons = _evaluate_battery_verdict(
-        battery, min_kill_rate=min_kill_rate
-    )
-
-    # --- Arm 3: Pure Diff-Scoped AST Mutation Only (no Tier 0, no idempotence, no literal guard, no PCT) ---
-    arm3_verdict = mut_verdict or "PASS"
-    arm3_reasons = tuple(mut_reasons) if mut_reasons else ("ALL_DIFF_MUTANTS_KILLED",)
-    arm3 = GateResult(
-        arm="MutationOnly",
-        verdict=arm3_verdict,
-        reasons=arm3_reasons,
-        total_mutants=battery.total_mutants,
-        run_mutants=battery.run_mutants,
-        killed_mutants=battery.killed_mutants,
-        survived_mutants=battery.survived_mutants,
-        kill_rate=battery.kill_rate,
-        idempotent=True,
-        literal_guards=(),
-        tier0_findings=(),
-        runner_mode=runner_mode,
-        targets=tuple(targets),
-        elapsed_s=total_elapsed,
-        surviving_mutant_details=survivors,
-        **mutation_execution,
-    )
-
-    # --- Arm 4: Full 3-Way NoCheat Merge Gate (v0.3 + PCT Concurrency + TS/JS) ---
-    cal_mut_verdict, cal_mut_reasons = _evaluate_calibrated_gate_mutation(
-        battery, test_degraded=test_degraded
-    )
-    t0_blocks = [f for f in tier0_findings if f.severity == "block"]
-    t0_abstains = [f for f in tier0_findings if f.severity == "abstain"]
-
-    arm4_reasons: list[str] = []
-    if t0_blocks:
-        arm4_reasons.extend(f"[{f.rule_id}] {f.message}" for f in t0_blocks)
-    if not idempotent:
-        arm4_reasons.append(f"STATEFUL_NON_IDEMPOTENT: {idemp_msg}")
-    if conc_report.verdict == "BLOCK":
-        arm4_reasons.extend(conc_report.reasons)
-    if cal_mut_verdict == "BLOCK":
-        arm4_reasons.extend(cal_mut_reasons)
-
-    if arm4_reasons:
-        arm4_verdict = "BLOCK"
-    elif (
-        literal_guards
-        or t0_abstains
-        or cal_mut_verdict == "ABSTAIN"
-        or not doctest_ok
-        or conc_report.verdict == "ABSTAIN"
-    ):
-        arm4_verdict = "ABSTAIN"
-        for lg in literal_guards:
-            arm4_reasons.append(
-                f"SINGLE_LITERAL_GUARD({lg.rel_path}:{lg.lineno}): if {lg.cond_desc} -> {lg.return_desc}"
-            )
-        arm4_reasons.extend(f"[{f.rule_id}] {f.message}" for f in t0_abstains)
-        if not doctest_ok:
-            arm4_reasons.append(f"DOCTEST_CONTRACT_MISMATCH: {doctest_msg}")
-        if conc_report.verdict == "ABSTAIN":
-            arm4_reasons.extend(conc_report.reasons)
-        if cal_mut_verdict == "ABSTAIN":
-            arm4_reasons.extend(cal_mut_reasons)
-    else:
-        arm4_verdict = "PASS"
-        if "NO_MUTABLE_LOGIC_DIFF" in cal_mut_reasons:
-            arm4_reasons.append("NO_MUTABLE_LOGIC_DIFF")
+        total_elapsed = time.monotonic() - t0
+        if idemp_msg in {'CUSTOM_TEST_COMMAND', 'IDEMPOTENCE_SKIPPED_OR_SCRIPT_ONLY'}:
+            idempotence_execution = ProbeExecution('SKIPPED', idemp_msg)
+        elif idemp_msg in {'IDEMPOTENCE_TIMEOUT_INCONCLUSIVE', 'IDEMPOTENCE_LAUNCH_UNAVAILABLE'}:
+            idempotence_execution = ProbeExecution('INCONCLUSIVE', idemp_msg)
         else:
-            arm4_reasons.append("ZERO_COMMENT_PASS")
+            idempotence_execution = ProbeExecution('PASSED' if idempotent else 'FAILED', idemp_msg)
+        if conc_report.skip_reason:
+            concurrency_execution = ProbeExecution('SKIPPED', conc_report.skip_reason)
+        elif not conc_report.schedules_run:
+            concurrency_execution = ProbeExecution('INCONCLUSIVE', 'NO_CONCURRENCY_SCHEDULE_EXECUTED')
+        else:
+            concurrency_execution = ProbeExecution(
+                {'PASS': 'PASSED', 'ABSTAIN': 'INCONCLUSIVE', 'BLOCK': 'FAILED'}[conc_report.verdict],
+                next(iter(conc_report.reasons), 'CONCURRENCY_SCHEDULES_OBSERVED'),
+            )
+        mutation_execution = {
+            'mutant_runner_unavailable': battery.unavailable_mutants,
+            'mutant_timeout_kills': sum(result.status == 'KILLED_TIMEOUT' for result in battery.results),
+            'mutant_budget_unscored': battery.budget_unscored_mutants,
+            'mutant_unknown_timeouts': battery.unknown_timeout_mutants,
+        }
+        survivors = tuple(
+            SurvivingMutant(m.rel_path, m.lineno if m.lineno and m.lineno > 0 else None, m.desc, m.diff_line)
+            for m in (result.mutant for result in battery.results if result.status == 'SURVIVED')
+        )
+        mut_verdict, mut_reasons = _evaluate_battery_verdict(
+            battery, min_kill_rate=min_kill_rate
+        )
 
-    arm4 = GateResult(
-        arm="NoCheatGate",
-        verdict=arm4_verdict,
-        reasons=tuple(arm4_reasons),
-        total_mutants=battery.total_mutants,
-        run_mutants=battery.run_mutants,
-        killed_mutants=battery.killed_mutants,
-        survived_mutants=battery.survived_mutants,
-        kill_rate=battery.kill_rate,
-        idempotent=idempotent,
-        literal_guards=tuple(literal_guards),
-        tier0_findings=tier0_findings,
-        runner_mode=runner_mode,
-        targets=tuple(targets),
-        elapsed_s=total_elapsed,
-        concurrency_mode=conc_report.mode,
-        concurrency_verdict=conc_report.verdict,
-        concurrency_reasons=conc_report.reasons,
-        surviving_mutant_details=survivors,
-        idempotence_execution=idempotence_execution,
-        concurrency_execution=concurrency_execution,
-        **mutation_execution,
-    )
-    return arm3, arm4
+        arm3_verdict = mut_verdict or "PASS"
+        arm3_reasons = tuple(mut_reasons) if mut_reasons else ("ALL_DIFF_MUTANTS_KILLED",)
+        arm3 = GateResult(
+            arm="MutationOnly",
+            verdict=arm3_verdict,
+            reasons=arm3_reasons,
+            total_mutants=battery.total_mutants,
+            run_mutants=battery.run_mutants,
+            killed_mutants=battery.killed_mutants,
+            survived_mutants=battery.survived_mutants,
+            kill_rate=battery.kill_rate,
+            idempotent=True,
+            literal_guards=(),
+            tier0_findings=(),
+            runner_mode=runner_mode,
+            targets=tuple(targets),
+            elapsed_s=total_elapsed,
+            surviving_mutant_details=survivors,
+            **mutation_execution,
+        )
+
+        cal_mut_verdict, cal_mut_reasons = _evaluate_calibrated_gate_mutation(
+            battery, test_degraded=ores.test_degraded
+        )
+        t0_blocks = [f for f in ores.tier0_findings if f.severity == "block"]
+        t0_abstains = [f for f in ores.tier0_findings if f.severity == "abstain"]
+
+        arm4_reasons: list[str] = []
+        if t0_blocks:
+            arm4_reasons.extend(f"[{f.rule_id}] {f.message}" for f in t0_blocks)
+        if not idempotent:
+            arm4_reasons.append(f"STATEFUL_NON_IDEMPOTENT: {idemp_msg}")
+        if conc_report.verdict == "BLOCK":
+            arm4_reasons.extend(conc_report.reasons)
+        if cal_mut_verdict == "BLOCK":
+            arm4_reasons.extend(cal_mut_reasons)
+
+        if arm4_reasons:
+            arm4_verdict = "BLOCK"
+        elif (
+            ores.literal_guards
+            or t0_abstains
+            or cal_mut_verdict == "ABSTAIN"
+            or not doctest_ok
+            or conc_report.verdict == "ABSTAIN"
+        ):
+            arm4_verdict = "ABSTAIN"
+            for lg in ores.literal_guards:
+                arm4_reasons.append(
+                    f"SINGLE_LITERAL_GUARD({lg.rel_path}:{lg.lineno}): if {lg.cond_desc} -> {lg.return_desc}"
+                )
+            arm4_reasons.extend(f"[{f.rule_id}] {f.message}" for f in t0_abstains)
+            if not doctest_ok:
+                arm4_reasons.append(f"DOCTEST_CONTRACT_MISMATCH: {doctest_msg}")
+            if conc_report.verdict == "ABSTAIN":
+                arm4_reasons.extend(conc_report.reasons)
+            if cal_mut_verdict == "ABSTAIN":
+                arm4_reasons.extend(cal_mut_reasons)
+        else:
+            arm4_verdict = "PASS"
+            if "NO_MUTABLE_LOGIC_DIFF" in cal_mut_reasons:
+                arm4_reasons.append("NO_MUTABLE_LOGIC_DIFF")
+            else:
+                arm4_reasons.append("ZERO_COMMENT_PASS")
+
+        arm4 = GateResult(
+            arm="NoCheatGate",
+            verdict=arm4_verdict,
+            reasons=tuple(arm4_reasons),
+            total_mutants=battery.total_mutants,
+            run_mutants=battery.run_mutants,
+            killed_mutants=battery.killed_mutants,
+            survived_mutants=battery.survived_mutants,
+            kill_rate=battery.kill_rate,
+            idempotent=idempotent,
+            literal_guards=ores.literal_guards,
+            tier0_findings=ores.tier0_findings,
+            runner_mode=runner_mode,
+            targets=tuple(targets),
+            elapsed_s=total_elapsed,
+            concurrency_mode=conc_report.mode,
+            concurrency_verdict=conc_report.verdict,
+            concurrency_reasons=conc_report.reasons,
+            surviving_mutant_details=survivors,
+            idempotence_execution=idempotence_execution,
+            concurrency_execution=concurrency_execution,
+            **mutation_execution,
+        )
+        return arm3, arm4
+
+    def _merge_arm_results(arm_name: str, items: list[GateResult], *, is_arm4: bool) -> GateResult:
+        if len(items) == 1:
+            return items[0]
+        final_verdict = "PASS"
+        for it in items:
+            final_verdict = _join_verdict(final_verdict, it.verdict)
+
+        merged_reasons: list[str] = []
+        for it in items:
+            for r in it.reasons:
+                if final_verdict != "PASS" and r in _PASS_ONLY_REASONS:
+                    continue
+                if r not in merged_reasons:
+                    merged_reasons.append(r)
+        if not merged_reasons:
+            merged_reasons = ["ZERO_COMMENT_PASS" if is_arm4 else "ALL_DIFF_MUTANTS_KILLED"]
+
+        tot_m = sum(it.total_mutants for it in items)
+        run_m = sum(it.run_mutants for it in items)
+        kill_m = sum(it.killed_mutants for it in items)
+        surv_m = sum(it.survived_mutants for it in items)
+        kr = (kill_m / run_m) if run_m > 0 else 0.0
+        runners = "+".join(dict.fromkeys(it.runner_mode for it in items if it.runner_mode)) or "multi"
+        all_targets = tuple(dict.fromkeys(t for it in items for t in it.targets))
+        all_survivors = tuple(s for it in items for s in it.surviving_mutant_details)
+        py_item = next((it for it in items if it.runner_mode in {"pytest", "script", "custom"}), items[0])
+        base_diag = next((it.baseline_execution for it in items if it.baseline_execution is not None), None)
+
+        return GateResult(
+            arm=arm_name,
+            verdict=final_verdict,
+            reasons=tuple(merged_reasons),
+            total_mutants=tot_m,
+            run_mutants=run_m,
+            killed_mutants=kill_m,
+            survived_mutants=surv_m,
+            kill_rate=kr,
+            idempotent=all(it.idempotent for it in items),
+            literal_guards=all_literal_guards if is_arm4 else (),
+            tier0_findings=all_tier0_findings if is_arm4 else (),
+            runner_mode=runners,
+            targets=all_targets,
+            elapsed_s=time.monotonic() - t0,
+            concurrency_mode=py_item.concurrency_mode if is_arm4 else "none",
+            concurrency_verdict=py_item.concurrency_verdict if is_arm4 else "PASS",
+            concurrency_reasons=py_item.concurrency_reasons if is_arm4 else (),
+            baseline_execution=base_diag,
+            surviving_mutant_details=all_survivors,
+            idempotence_execution=py_item.idempotence_execution,
+            concurrency_execution=py_item.concurrency_execution,
+            mutant_runner_unavailable=sum(it.mutant_runner_unavailable for it in items),
+            mutant_timeout_kills=sum(it.mutant_timeout_kills for it in items),
+            mutant_budget_unscored=sum(it.mutant_budget_unscored for it in items),
+            mutant_unknown_timeouts=sum(it.mutant_unknown_timeouts for it in items),
+        )
+
+    arm3_list: list[GateResult] = []
+    arm4_list: list[GateResult] = []
+    with temporary_checkout(repo_dir, head_ref) as worktree:
+        for ores in oracle_results:
+            a3, a4 = _run_single_language(worktree, ores, lang_mutant_alloc.get(ores.language, []))
+            arm3_list.append(a3)
+            arm4_list.append(a4)
+
+    return _merge_arm_results("MutationOnly", arm3_list, is_arm4=False), _merge_arm_results("NoCheatGate", arm4_list, is_arm4=True)
 
 
 def evaluate_pr_pair(

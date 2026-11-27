@@ -80,8 +80,8 @@ def resolve_revisions(repo: Path, base: str, head: str) -> tuple[str, str]:
 
 
 def _validate_domains(inputs: dict, *, minimum: int = 0, reserved: set[str] | None = None) -> None:
-    if not isinstance(inputs, dict) or not minimum <= len(inputs) <= 3:
-        raise ValueError(f'expected {minimum}..3 named inputs')
+    if not isinstance(inputs, dict) or not minimum <= len(inputs) <= 8:
+        raise ValueError(f'expected {minimum}..8 named inputs')
     for name, domain in inputs.items():
         if not name.isidentifier() or name in {'result', *_HELPERS, *(reserved or set())}:
             raise ValueError('invalid or reserved input name')
@@ -113,8 +113,8 @@ def _load_contracts(raw: str) -> tuple[list[dict], tuple[str, ...]]:
             raise ValueError('source root leaves checkout')
     roots = tuple(dict.fromkeys(str(PurePosixPath(rel)) for rel in roots))
     contracts = data['contracts']
-    if not isinstance(contracts, list) or not 1 <= len(contracts) <= 8:
-        raise ValueError('expected 1..8 contracts')
+    if not isinstance(contracts, list) or not 1 <= len(contracts) <= 64:
+        raise ValueError('expected 1..64 contracts')
     targets: set[str] = set()
     for contract in contracts:
         if not isinstance(contract, dict):
@@ -159,6 +159,132 @@ def write_contract_scaffold(repo: Path, contract: dict, source_roots: list[str])
         candidate.write_text(raw, encoding='utf-8')
         os.link(candidate, destination)
     return destination
+
+
+def parse_compact_param_spec(spec: str) -> tuple[str, dict[str, object]]:
+    """Parse ergonomic `--param` shorthand into `(name, domain)` without raw JSON escaping.
+
+    Supported forms:
+      - `units=int:1..100` (or `units=int`)
+      - `premium=bool`
+      - `rate=float:0..10` (or `rate=float`)
+      - `label=str:16` (or `label=str`)
+      - `tier=enum:free,pro,enterprise`
+    """
+    if '=' not in spec:
+        raise ValueError(f'expected name=type[:bounds] in --param {spec!r}')
+    name, rhs = spec.split('=', 1)
+    name = name.strip()
+    rhs = rhs.strip()
+    if not name.isidentifier():
+        raise ValueError(f'invalid parameter name {name!r}')
+    kind, _, detail = rhs.partition(':')
+    kind = kind.strip().lower()
+    detail = detail.strip()
+    if kind == 'bool':
+        return name, {'type': 'bool'}
+    if kind == 'int':
+        if '..' in detail:
+            lo_s, hi_s = detail.split('..', 1)
+            return name, {'type': 'int', 'min': int(lo_s.strip()), 'max': int(hi_s.strip())}
+        return name, {'type': 'int', 'min': -10, 'max': 100}
+    if kind == 'float':
+        if '..' in detail:
+            lo_s, hi_s = detail.split('..', 1)
+            return name, {'type': 'float', 'min': float(lo_s.strip()), 'max': float(hi_s.strip())}
+        return name, {'type': 'float', 'min': -10.0, 'max': 100.0}
+    if kind == 'str':
+        max_len = int(detail) if detail else 16
+        return name, {'type': 'str', 'max_length': max_len}
+    if kind == 'enum':
+        vals = [v.strip() for v in detail.split(',') if v.strip()]
+        if not vals:
+            raise ValueError(f'enum param {name!r} requires comma-separated values')
+        return name, {'type': 'enum', 'values': vals}
+    raise ValueError(f'unsupported --param type {kind!r} (expected int|bool|float|str|enum)')
+
+
+def _annotation_to_domain(ann: ast.AST | None) -> dict[str, object]:
+    if isinstance(ann, ast.Name):
+        if ann.id == 'bool':
+            return {'type': 'bool'}
+        if ann.id == 'int':
+            return {'type': 'int', 'min': -10, 'max': 100}
+        if ann.id == 'float':
+            return {'type': 'float', 'min': -10.0, 'max': 100.0}
+        if ann.id == 'str':
+            return {'type': 'str', 'max_length': 16}
+    return {'type': 'int', 'min': -10, 'max': 100}
+
+
+def infer_contract_inputs_from_ast(
+    repo: Path,
+    target: str,
+    source_roots: tuple[str, ...] = (),
+) -> tuple[dict[str, dict[str, object]], str]:
+    """Statically inspect a Python function signature via AST (zero import execution)."""
+    if not _TARGET.fullmatch(target):
+        raise ValueError(f'invalid module:function target {target!r}')
+    mod_name, fn_name = target.split(':', 1)
+    mod_path = _module_path(repo.resolve(), mod_name, source_roots)
+    if mod_path is None:
+        raise ValueError(f'could not locate source file for module {mod_name!r}')
+    tree = ast.parse(mod_path.read_text(encoding='utf-8'), filename=str(mod_path))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
+            params = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            domains: dict[str, dict[str, object]] = {}
+            for p in params:
+                if p.arg in {'self', 'cls'}:
+                    continue
+                domains[p.arg] = _annotation_to_domain(p.annotation)
+            if not domains:
+                raise ValueError(f'{target} has no scalar positional/keyword parameters to infer')
+            exec_kind = 'asyncio' if isinstance(node, ast.AsyncFunctionDef) else 'sync'
+            return domains, exec_kind
+    raise ValueError(f'function {fn_name!r} not found at module top level in {mod_path.name}')
+
+
+def upsert_contract_scaffold(
+    repo: Path,
+    contract: dict,
+    source_roots: list[str],
+    *,
+    replace_existing: bool = False,
+) -> tuple[Path, str]:
+    """Atomically create or append/update a contract entry inside `.nocheat-contracts.json`."""
+    destination = repo / CONTRACT_PATH
+    if destination.is_file():
+        existing = json.loads(destination.read_text(encoding='utf-8'))
+        if not isinstance(existing, dict) or not isinstance(existing.get('contracts'), list):
+            raise ValueError(f'existing {CONTRACT_PATH} is malformed')
+        contracts = list(existing['contracts'])
+        merged_roots = list(dict.fromkeys([*(existing.get('source_roots') or []), *source_roots]))
+        idx = next((i for i, c in enumerate(contracts) if isinstance(c, dict) and c.get('target') == contract['target']), None)
+        if idx is not None:
+            if not replace_existing:
+                raise ValueError(f"contract target {contract['target']!r} already exists (pass --replace to overwrite)")
+            contracts[idx] = contract
+            action = 'updated'
+        else:
+            contracts.append(contract)
+            action = 'appended'
+        document: dict[str, object] = {'contracts': contracts}
+        if merged_roots:
+            document['source_roots'] = merged_roots
+    else:
+        document = {'contracts': [contract]}
+        if source_roots:
+            document['source_roots'] = list(dict.fromkeys(source_roots))
+        action = 'created'
+
+    raw = json.dumps(document, indent=2, ensure_ascii=True) + '\n'
+    _load_contracts(raw)
+    with tempfile.TemporaryDirectory(prefix='.nocheat-init-', dir=repo) as tmp:
+        candidate = Path(tmp) / CONTRACT_PATH
+        candidate.write_text(raw, encoding='utf-8')
+        os.replace(candidate, destination)
+    return destination, action
 
 
 def _prefixes(root: Path, source_roots: tuple[str, ...]) -> list[Path]:

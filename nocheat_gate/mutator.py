@@ -37,15 +37,35 @@ _AstPathStep = tuple[str, int | None]
 
 
 @dataclass(frozen=True)
+class SpanPatch:
+    """Compact byte-span patch avoiding full-file string duplication across IPC."""
+
+    byte_start: int
+    byte_end: int
+    replacement: bytes
+
+
+@dataclass(frozen=True)
 class MutantCandidate:
-    """A single valid 1st-order AST mutant targeting one changed Python slice."""
+    """A single valid 1st-order AST mutant targeting one changed source slice."""
 
     rel_path: str
     scope_name: str
     lineno: int
     desc: str
-    mutated_source: str
+    mutated_source: str = ""
     diff_line: tuple[str, str] | None = None
+    patch: SpanPatch | None = None
+    language: str = "python"
+
+
+def materialize_mutant_bytes(base_bytes: bytes, mutant: MutantCandidate) -> bytes:
+    """Materialize mutant file bytes via compact SpanPatch when available, else full source."""
+    if mutant.patch is not None:
+        sp = mutant.patch
+        if 0 <= sp.byte_start <= sp.byte_end <= len(base_bytes):
+            return base_bytes[:sp.byte_start] + sp.replacement + base_bytes[sp.byte_end:]
+    return mutant.mutated_source.encode("utf-8")
 
 
 @dataclass(frozen=True)

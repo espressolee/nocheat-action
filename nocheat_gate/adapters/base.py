@@ -10,11 +10,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..diff_scope import ChangedScope, DiffScope
 from ..mutator import LiteralGuardHit, MutantCandidate
 from ..tier0_syntax import Tier0Finding
+
+
+@dataclass(frozen=True)
+class TestExecutionPlan:
+    """Language-specific test runner selection and concrete target list."""
+
+    language: str
+    runner_id: str
+    targets: tuple[str, ...]
+    issues: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,31 @@ class LanguageOracle(Protocol):
         head_ref: str,
         scope: DiffScope,
     ) -> LanguageAnalysisResult: ...
+
+
+@runtime_checkable
+class LanguagePack(LanguageOracle, Protocol):
+    """Full v2 multi-language pack encapsulating analysis, workspace prep, discovery, and execution."""
+
+    def prepare_workspace(self, host_repo_dir: Path, isolated_worktree: Path) -> None: ...
+
+    def discover_tests(
+        self,
+        isolated_worktree: Path,
+        scope: DiffScope,
+        analysis: LanguageAnalysisResult,
+        *,
+        test_cmd: tuple[str, ...] | None = None,
+    ) -> TestExecutionPlan: ...
+
+    def run_tests(
+        self,
+        isolated_worktree: Path,
+        plan: TestExecutionPlan,
+        *,
+        timeout_s: float = 5.0,
+        test_cmd: tuple[str, ...] | None = None,
+    ) -> Any: ...
 
 
 class OracleRegistry:

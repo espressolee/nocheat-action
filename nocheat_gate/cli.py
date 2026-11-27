@@ -3,17 +3,31 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict
+import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
+from typing import Iterator
 import unicodedata
 
 from .gate import GateResult, ProbeExecution, evaluate_nocheat_gate
-from .contracts import CONTRACT_PATH, write_contract_scaffold
+from .contracts import (
+    CONTRACT_PATH,
+    _load_contracts,
+    infer_contract_inputs_from_ast,
+    parse_compact_param_spec,
+    upsert_contract_scaffold,
+    write_contract_scaffold,
+)
 
 _NON_MUTABLE_PASS_REASONS = frozenset(
     {"NO_EXECUTABLE_SOURCE_CHANGES", "NO_MUTABLE_LOGIC_DIFF"}
@@ -180,18 +194,206 @@ def render_markdown_summary(res: GateResult, mode: str) -> str:
     return "\n".join(lines)
 
 
+def _resolve_tokenblame_spool() -> Path:
+    env_dir = os.environ.get("TOKENBLAME_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser() / "nocheat_verdicts.jsonl"
+    home = Path.home()
+    mac_gwl = home / "Library" / "Application Support" / "git-worklog"
+    if mac_gwl.exists():
+        return mac_gwl / "observatory" / "nocheat_verdicts.jsonl"
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "tokenblame" / "nocheat_verdicts.jsonl"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else (home / ".local" / "share")
+    return base / "tokenblame" / "nocheat_verdicts.jsonl"
+
+
+def _maybe_spool_verdict_receipt(
+    repo_dir: Path,
+    head_ref: str,
+    res: GateResult,
+    mode: str,
+    *,
+    force_spool: bool = False,
+) -> None:
+    """Optionally spool a zero-code verdict receipt for TokenBlame cross-tool telemetry."""
+    if not force_spool and os.environ.get("NOCHEAT_SPOOL_RECEIPTS") != "1":
+        return
+    try:
+        spool_path = _resolve_tokenblame_spool()
+        spool_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        head_proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(repo_dir), "rev-parse", "--verify", f"{head_ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        head_oid = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+        rec = {
+            "schema": "nocheat-verdict-receipt/1.0",
+            "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "repo_root_sha": hashlib.sha256(str(repo_dir.resolve()).encode("utf-8")).hexdigest()[:16],
+            "head_oid": head_oid,
+            "mode": mode,
+            "verdict": res.verdict,
+            "runner_mode": res.runner_mode,
+            "run_mutants": res.run_mutants,
+            "killed_mutants": res.killed_mutants,
+            "survived_mutants": res.survived_mutants,
+            "tier0_count": len(res.tier0_findings),
+            "literal_guards_count": len(res.literal_guards),
+        }
+        with spool_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+        os.chmod(spool_path, 0o600)
+    except OSError:
+        pass
+
+
+def _emit_github_annotations(res: GateResult, mode: str) -> None:
+    """Emit inline PR file:line annotations when running inside GitHub Actions."""
+    if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        return
+    level = "error" if (mode == "enforce" and res.verdict == "BLOCK") else "warning"
+    for m in res.surviving_mutant_details[:10]:
+        if not m.rel_path or not m.lineno:
+            continue
+        detail = f"{m.diff_line[0]} -> {m.diff_line[1]}" if m.diff_line else m.description
+        msg = _single_line(f"Surviving diff mutant ({m.description}): {detail}")
+        print(f"::{level} file={m.rel_path},line={m.lineno},title=NoCheat Surviving Mutant::{msg}")
+    for g in res.literal_guards[:10]:
+        msg = _single_line(f"Single-literal shortcut guard: if {g.cond_desc} -> {g.return_desc}")
+        print(f"::warning file={g.rel_path},line={g.lineno},title=NoCheat Literal Guard::{msg}")
+    for fnd in res.tier0_findings[:10]:
+        if not fnd.rel_path:
+            continue
+        f_lvl = "error" if (mode == "enforce" and fnd.severity == "block") else "warning"
+        line_part = f",line={fnd.lineno}" if fnd.lineno and fnd.lineno > 0 else ""
+        print(f"::{f_lvl} file={fnd.rel_path}{line_part},title=NoCheat {fnd.rule_id}::{_single_line(fnd.message)}")
+
+
+@contextmanager
+def _ephemeral_local_snapshot_repo(
+    repo_dir: Path,
+    base_ref: str,
+    *,
+    staged_only: bool,
+) -> Iterator[tuple[Path, str, str]]:
+    """Build a zero-mutation temporary Git repo capturing staged or working-tree edits as HEAD."""
+    resolved = repo_dir.resolve()
+    base_oid = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(resolved), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    head_oid = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(resolved), "rev-parse", "--verify", "HEAD^{commit}"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    with tempfile.TemporaryDirectory(prefix="nocheat_local_") as tmp:
+        tmp_repo = Path(tmp) / "repo"
+        subprocess.run(
+            ["git", "clone", "-q", "--local", "--no-checkout", str(resolved), str(tmp_repo)],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(tmp_repo), "checkout", "-q", "--detach", head_oid],
+            check=True, capture_output=True, text=True,
+        )
+        if staged_only:
+            diff_bytes = subprocess.run(
+                ["git", "--no-optional-locks", "-C", str(resolved), "diff", "--cached", "--binary", "HEAD"],
+                check=True, capture_output=True,
+            ).stdout
+            if diff_bytes:
+                subprocess.run(
+                    ["git", "-C", str(tmp_repo), "apply", "--index", "--whitespace=nowarn"],
+                    input=diff_bytes,
+                    check=True, capture_output=True,
+                )
+        else:
+            st_raw = subprocess.run(
+                ["git", "--no-optional-locks", "-C", str(resolved), "status", "--porcelain=v1", "-z", "-uall"],
+                check=True, capture_output=True,
+            ).stdout
+            entries = [e for e in st_raw.split(b"\0") if e]
+            idx = 0
+            while idx < len(entries):
+                rec = entries[idx]
+                code = rec[:2].decode("ascii", errors="replace")
+                rel = rec[3:].decode("utf-8", errors="strict")
+                idx += 1
+                if code[0] in ("R", "C") or code[1] in ("R", "C"):
+                    if idx < len(entries):
+                        old_rel = entries[idx].decode("utf-8", errors="strict")
+                        idx += 1
+                        old_dst = tmp_repo / old_rel
+                        if old_dst.exists():
+                            old_dst.unlink()
+                src_p = resolved / rel
+                dst_p = tmp_repo / rel
+                if src_p.is_file() or src_p.is_symlink():
+                    dst_p.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_p.exists() or dst_p.is_symlink():
+                        dst_p.unlink()
+                    if src_p.is_symlink():
+                        os.symlink(os.readlink(src_p), dst_p)
+                    else:
+                        shutil.copy2(src_p, dst_p)
+                elif not src_p.exists() and (dst_p.exists() or dst_p.is_symlink()):
+                    dst_p.unlink()
+            subprocess.run(["git", "-C", str(tmp_repo), "add", "-A"], check=True, capture_output=True)
+
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "NoCheat Local",
+            "GIT_AUTHOR_EMAIL": "local@nocheat.invalid",
+            "GIT_COMMITTER_NAME": "NoCheat Local",
+            "GIT_COMMITTER_EMAIL": "local@nocheat.invalid",
+        }
+        subprocess.run(
+            ["git", "-C", str(tmp_repo), "commit", "-q", "--allow-empty", "--no-verify", "-m", "nocheat: ephemeral local snapshot"],
+            check=True, capture_output=True, text=True, env=env,
+        )
+        # Preserve host node_modules visibility for TS/JS packs without tracking it in Git
+        host_nm = resolved / "node_modules"
+        if host_nm.is_dir() and not (tmp_repo / "node_modules").exists():
+            try:
+                os.symlink(host_nm, tmp_repo / "node_modules")
+            except OSError:
+                pass
+        yield tmp_repo, base_oid, "HEAD"
+
+
 def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+    argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == 'init-contract':
         return _init_contract(argv[1:])
+    if argv and argv[0] == 'contract':
+        return _contract_cli(argv[1:])
+    if argv and argv[0] == 'explain':
+        return _explain_cli(argv[1:])
+    if argv and argv[0] == 'check':
+        argv = argv[1:]
 
     parser = argparse.ArgumentParser(
+        prog='nocheat-gate',
         description='NoCheat Merge Gate: Zero-LLM Deterministic PR Verification & Soundness Gate',
-        epilog='Run nocheat-gate init-contract --help to scaffold an explicit contract.',
+        epilog='Subcommands: check (default), contract add|list|validate, explain <CODE>, init-contract.',
     )
     parser.add_argument("--repo", default=".", type=Path, help="Path to repository root")
     parser.add_argument("--base", default="main", help="Base git ref/commit to compare against")
     parser.add_argument("--head", default="HEAD", help="Head git ref/commit to compare")
+    local_grp = parser.add_mutually_exclusive_group()
+    local_grp.add_argument(
+        "--staged",
+        action="store_true",
+        help="Evaluate staged git index changes without mutating the repository (base defaults to HEAD if --base omitted)",
+    )
+    local_grp.add_argument(
+        "-w", "--working-tree",
+        action="store_true",
+        help="Evaluate uncommitted working-tree changes without mutating the repository",
+    )
     parser.add_argument(
         "--mode",
         choices=["observe", "enforce"],
@@ -231,6 +433,11 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
         default=[],
         help='Repeatable glob pattern excluding matching repo-relative paths from evaluation',
     )
+    parser.add_argument(
+        '--spool-receipt',
+        action='store_true',
+        help='Append a minimal zero-code verdict receipt to TokenBlame local spool',
+    )
 
     args = parser.parse_args(argv)
     if args.baseline_timeout is not None and args.baseline_timeout <= 0:
@@ -248,17 +455,22 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
     base_ref = args.base
     head_ref = args.head
     mode = args.mode
+    if (args.staged or args.working_tree) and "--base" not in argv:
+        base_ref = "HEAD"
 
-    res = evaluate_nocheat_gate(
-        repo_dir,
-        base_ref,
-        head_ref,
+    eval_kwargs = {
         **({"baseline_timeout_s": args.baseline_timeout} if args.baseline_timeout is not None else {}),
         **({"native_pythons": native_pythons} if native_pythons is not None else {}),
         **({'test_cmd': test_cmd} if test_cmd is not None else {}),
         **({'include_paths': tuple(args.include)} if args.include else {}),
         **({'exclude_paths': tuple(args.exclude)} if args.exclude else {}),
-    )
+    }
+
+    if args.staged or args.working_tree:
+        with _ephemeral_local_snapshot_repo(repo_dir, base_ref, staged_only=args.staged) as (snap_repo, snap_base, snap_head):
+            res = evaluate_nocheat_gate(snap_repo, snap_base, snap_head, **eval_kwargs)
+    else:
+        res = evaluate_nocheat_gate(repo_dir, base_ref, head_ref, **eval_kwargs)
 
     if args.json:
         payload = {
@@ -317,6 +529,10 @@ def main(argv: list[str] | None = None, *, native_pythons: dict | None = None) -
             print('Surviving diff mutants:')
             print('\n'.join(_surviving_mutants(res, markdown=False)))
 
+    if not args.json:
+        _emit_github_annotations(res, mode)
+    _maybe_spool_verdict_receipt(repo_dir, head_ref, res, mode, force_spool=args.spool_receipt)
+
     md_summary = render_markdown_summary(res, mode)
 
     target_summary_path = args.summary_file or (
@@ -373,6 +589,121 @@ def _init_contract(argv: list[str]) -> int:
         print(f'[NoCheatGate] Unable to create {CONTRACT_PATH}: {_single_line(str(exc))}', file=sys.stderr)
         return 1
     print(f'Created {path.name}. Review the contract and land it on the base branch before using it.')
+    return 0
+
+
+def _contract_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog='nocheat-gate contract',
+        description=f'Manage explicit {CONTRACT_PATH} specifications (add, list, validate).',
+    )
+    sub = parser.add_subparsers(dest='subcmd', required=True)
+
+    p_add = sub.add_parser('add', help='Add or update one contract (supports AST signature inference and --param shorthand)')
+    p_add.add_argument('target', help='Target module:function (e.g. examples.billing:charge)')
+    p_add.add_argument('--repo', type=Path, default=Path('.'), help='Repository root')
+    p_add.add_argument('--param', action='append', default=[], help='Repeatable shorthand: name=int:1..100 | name=bool | name=str:16 | name=enum:a,b')
+    p_add.add_argument('--inputs', help='Optional raw JSON inputs object (overrides --param/AST inference)')
+    p_add.add_argument('--ensures', required=True, help='Postcondition expression using inputs and result')
+    p_add.add_argument('--requires', help='Optional input precondition expression')
+    p_add.add_argument('--source-root', action='append', default=[], help='Relative import root, repeatable')
+    p_add.add_argument('--execution', choices=('sync', 'asyncio'), default=None)
+    p_add.add_argument('--replace', action='store_true', help='Overwrite an existing contract with the same target')
+
+    p_ls = sub.add_parser('list', help=f'List contracts declared in {CONTRACT_PATH}')
+    p_ls.add_argument('--repo', type=Path, default=Path('.'))
+
+    p_val = sub.add_parser('validate', help=f'Validate {CONTRACT_PATH} syntax and domain rules')
+    p_val.add_argument('--repo', type=Path, default=Path('.'))
+
+    args = parser.parse_args(argv)
+    repo = args.repo.resolve()
+
+    if args.subcmd == 'list':
+        cpath = repo / CONTRACT_PATH
+        if not cpath.is_file():
+            print(f'[NoCheatGate] No {CONTRACT_PATH} found in {repo}')
+            return 0
+        try:
+            contracts, roots = _load_contracts(cpath.read_text(encoding='utf-8'))
+        except Exception as exc:
+            print(f'[NoCheatGate] Invalid {CONTRACT_PATH}: {_single_line(str(exc))}', file=sys.stderr)
+            return 2
+        if roots:
+            print(f'source_roots: {", ".join(roots)}')
+        for c in contracts:
+            kind = 'stateful' if 'operations' in c else c.get('_execution', 'sync')
+            ens = c.get('ensures', f"{len(c.get('operations', []))} operations")
+            print(f"- {c['target']} ({kind}): {ens}")
+        return 0
+
+    if args.subcmd == 'validate':
+        cpath = repo / CONTRACT_PATH
+        if not cpath.is_file():
+            print(f'[NoCheatGate] {CONTRACT_PATH} not found.', file=sys.stderr)
+            return 1
+        try:
+            contracts, _ = _load_contracts(cpath.read_text(encoding='utf-8'))
+        except Exception as exc:
+            print(f'[NoCheatGate] INVALID {CONTRACT_PATH}: {_single_line(str(exc))}', file=sys.stderr)
+            return 2
+        print(f'[NoCheatGate] VALID {CONTRACT_PATH} ({len(contracts)} contract(s))')
+        return 0
+
+    try:
+        inferred_exec = 'sync'
+        if args.inputs is not None:
+            inputs_obj = json.loads(args.inputs)
+        elif args.param:
+            inputs_obj = {}
+            for spec in args.param:
+                k, dom = parse_compact_param_spec(spec)
+                inputs_obj[k] = dom
+        else:
+            inputs_obj, inferred_exec = infer_contract_inputs_from_ast(
+                repo, args.target, tuple(args.source_root)
+            )
+        contract: dict[str, object] = {
+            'target': args.target,
+            'inputs': inputs_obj,
+            'ensures': args.ensures,
+        }
+        if args.requires is not None:
+            contract['requires'] = args.requires
+        eff_exec = args.execution or inferred_exec
+        if eff_exec != 'sync':
+            contract['execution'] = eff_exec
+        path, action = upsert_contract_scaffold(
+            repo, contract, args.source_root, replace_existing=args.replace
+        )
+    except (KeyError, TypeError, ValueError, SyntaxError, RecursionError) as exc:
+        parser.error(f'invalid contract: {_single_line(str(exc))}')
+    except OSError as exc:
+        print(f'[NoCheatGate] Unable to update {CONTRACT_PATH}: {_single_line(str(exc))}', file=sys.stderr)
+        return 1
+    print(f"{action.capitalize()} {args.target} in {path.name}. Review and land on base branch before enforcing.")
+    return 0
+
+
+_EXTRA_EXPLANATIONS = {
+    'POD006': 'A test mocked the exact changed production module (tautological self-mock). Mock external I/O dependencies only and assert real changed module behavior.',
+    'SEVERE_MUTATION_COLLAPSE': 'Less than 30% of diff-scoped AST mutants were killed by the PR tests. Add assertions that pin boundary conditions and return values.',
+    'DEGRADED_TEST_WITH_SURVIVING_MUTANTS': 'The PR weakened or removed assertions while leaving diff mutants unkilled (<70% kill rate). Restore strict assertions.',
+    'ZERO_KILL_CORE_SCOPE': 'One or more changed functions had >=2 mutants run with 0% killed. Add dedicated tests covering those changed functions.',
+    'CONTRACT_COUNTEREXAMPLE': 'A base-pinned explicit contract found a deterministic reproducible input where candidate output violated the postcondition while baseline held.',
+}
+
+
+def _explain_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog='nocheat-gate explain', description='Explain a NoCheat verdict or reason code.')
+    parser.add_argument('code', help='Reason code (e.g. SINGLE_LITERAL_GUARD, POD006, CONTRACT_CHANGE_REQUIRES_REVIEW)')
+    args = parser.parse_args(argv)
+    code = args.code.strip().upper()
+    msg = _EXTRA_EXPLANATIONS.get(code) or _ABSTAIN_ACTIONS.get(code)
+    if not msg:
+        print(f'Unknown NoCheat reason code: {code}', file=sys.stderr)
+        return 1
+    print(f'[{code}] {msg}')
     return 0
 
 

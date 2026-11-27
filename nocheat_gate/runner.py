@@ -12,11 +12,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 
+from .adapters.base import TestExecutionPlan
 from .adapters.ts_js import is_ts_js_path
-from .diff_scope import ChangedScope, FileDiffSummary, is_test_path, matches_pytest_file
-from .mutator import MutantCandidate
+from .diff_scope import ChangedScope, DiffScope, FileDiffSummary, is_test_path, matches_pytest_file
+from .mutator import MutantCandidate, materialize_mutant_bytes
 from .runtime import NODE_MODULES
 from .environment import diagnose_execution
 
@@ -103,10 +104,31 @@ def temporary_checkout(repo_dir: Path, rev: str) -> Iterator[Path]:
 
 @contextmanager
 def temporary_snapshot(template: Path) -> Iterator[Path]:
-    """Provide a fresh copy of an unexecuted Git snapshot for a runner phase."""
+    """Provide a fresh isolated copy of an unexecuted Git snapshot (CoW clone when supported)."""
     with tempfile.TemporaryDirectory(prefix='nocheat_run_') as temp:
         root = Path(temp) / 'checkout'
-        shutil.copytree(template, root, symlinks=True)
+        cloned = False
+        try:
+            if sys.platform == "darwin":
+                proc = subprocess.run(
+                    ["cp", "-cPR", str(template), str(root)],
+                    capture_output=True,
+                    check=False,
+                )
+                cloned = proc.returncode == 0 and root.is_dir()
+            elif sys.platform.startswith("linux"):
+                proc = subprocess.run(
+                    ["cp", "-a", "--reflink=auto", str(template), str(root)],
+                    capture_output=True,
+                    check=False,
+                )
+                cloned = proc.returncode == 0 and root.is_dir()
+        except OSError:
+            cloned = False
+        if not cloned:
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            shutil.copytree(template, root, symlinks=True)
         yield root
 
 
@@ -230,6 +252,149 @@ def _ensure_vitest_node_modules(worktree: Path) -> None:
     nm = worktree / "node_modules"
     if not nm.exists() and _SHARED_NODE_MODULES.exists():
         os.symlink(_SHARED_NODE_MODULES, nm)
+
+
+def prepare_ts_js_workspace(
+    host_repo_dir: Path,
+    worktree: Path,
+    changed_rel_paths: tuple[str, ...] = (),
+) -> None:
+    """Mount host `.gitignore`d `node_modules` read-only via symlink into isolated `git archive` checkout.
+
+    Fixes dead Jest/Vitest runner detection when `node_modules` is excluded from Git trees while
+    keeping source files strictly isolated inside `worktree`.
+    """
+    resolved_host = Path(host_repo_dir).resolve()
+    wt_nm = worktree / "node_modules"
+    if not wt_nm.exists() and not wt_nm.is_symlink():
+        # Check host repo root first, then up to 2 ancestor workspace roots (monorepo hoisting)
+        candidates = [resolved_host / "node_modules"]
+        for anc in list(resolved_host.parents)[:2]:
+            candidates.append(anc / "node_modules")
+        for cand in candidates:
+            if cand.is_dir():
+                try:
+                    os.symlink(cand, wt_nm)
+                    break
+                except OSError:
+                    pass
+
+    # Also symlink package-local `node_modules` for changed monorepo subpackages when present
+    seen_dirs: set[Path] = set()
+    for rel in changed_rel_paths:
+        p = Path(rel)
+        for parent in p.parents:
+            if parent == Path(".") or parent in seen_dirs:
+                continue
+            seen_dirs.add(parent)
+            host_sub_nm = resolved_host / parent / "node_modules"
+            wt_sub_dir = worktree / parent
+            wt_sub_nm = wt_sub_dir / "node_modules"
+            if host_sub_nm.is_dir() and wt_sub_dir.is_dir() and not wt_sub_nm.exists() and not wt_sub_nm.is_symlink():
+                try:
+                    os.symlink(host_sub_nm, wt_sub_nm)
+                except OSError:
+                    pass
+
+
+def discover_python_plan(
+    worktree: Path,
+    scope: DiffScope,
+    prod_scopes: tuple[ChangedScope, ...],
+    fallback_scopes: tuple[ChangedScope, ...],
+    *,
+    test_cmd: tuple[str, ...] | None = None,
+) -> TestExecutionPlan:
+    """Build deterministic Python TestExecutionPlan (pytest/script/custom) with collision guards."""
+    from .impact import source_module_collisions
+
+    py_prod = tuple(f for f in scope.prod_files if f.rel_path.endswith(".py"))
+    py_tests = tuple(f for f in scope.test_files if f.rel_path.endswith(".py"))
+    py_scopes = prod_scopes or fallback_scopes
+
+    source_issues = scope.issues + source_module_collisions(
+        worktree,
+        (item.rel_path for item in (*py_prod, *fallback_scopes)),
+    )
+    if source_issues:
+        return TestExecutionPlan(
+            language="python",
+            runner_id="custom" if test_cmd is not None else "pytest",
+            targets=(),
+            issues=tuple(source_issues),
+        )
+    if test_cmd is not None:
+        return TestExecutionPlan(language="python", runner_id="custom", targets=(), issues=())
+
+    if (
+        scope.pytest_python_files is None
+        and not scope.pytest_testpaths
+        and (worktree / "test.py").exists()
+        and not (worktree / "pytest.ini").exists()
+        and not (worktree / "pyproject.toml").exists()
+    ):
+        return TestExecutionPlan(language="python", runner_id="script", targets=("test.py",))
+
+    try:
+        py_targets = _find_pytest_targets(
+            worktree,
+            py_tests,
+            py_prod,
+            py_scopes,
+            scope.pytest_python_files,
+            scope.pytest_testpaths,
+        )
+    except PytestDiscoveryError as exc:
+        return TestExecutionPlan(language="python", runner_id="pytest", targets=(), issues=(str(exc),))
+
+    if py_targets:
+        return TestExecutionPlan(language="python", runner_id="pytest", targets=tuple(py_targets))
+    if scope.pytest_python_files is None and not scope.pytest_testpaths and (worktree / "test.py").exists():
+        return TestExecutionPlan(language="python", runner_id="script", targets=("test.py",))
+    return TestExecutionPlan(language="python", runner_id="pytest", targets=())
+
+
+def discover_ts_js_plan(
+    worktree: Path,
+    scope: DiffScope,
+    prod_scopes: tuple[ChangedScope, ...],
+    fallback_scopes: tuple[ChangedScope, ...],
+) -> TestExecutionPlan:
+    """Build deterministic TS/JS TestExecutionPlan (`jest|vitest|node_test`) after workspace prep."""
+    ts_prod = tuple(f for f in scope.prod_files if is_ts_js_path(f.rel_path))
+    ts_tests = tuple(f for f in scope.test_files if is_ts_js_path(f.rel_path))
+    ts_scopes = prod_scopes or fallback_scopes
+    ts_targets = _find_ts_js_targets(worktree, ts_tests, ts_prod, ts_scopes)
+    if not ts_targets:
+        return TestExecutionPlan(language="ts_js", runner_id="vitest", targets=())
+
+    pkg_text = ""
+    pkg = worktree / "package.json"
+    if pkg.exists():
+        pkg_text = pkg.read_text(encoding="utf-8", errors="ignore")
+    joined_src = "\n".join(
+        (worktree / t).read_text(encoding="utf-8", errors="ignore")[:1000]
+        for t in ts_targets
+        if (worktree / t).exists()
+    )
+    has_jest_cfg = any(
+        (worktree / f).exists()
+        for f in ("jest.config.js", "jest.config.ts", "jest.config.mjs", "jest.config.cjs")
+    )
+    has_vitest_cfg = any(
+        (worktree / f).exists()
+        for f in ("vitest.config.ts", "vitest.config.js", "vitest.config.mts")
+    )
+    jest_bin = worktree / "node_modules" / ".bin" / "jest"
+    if (has_jest_cfg or '"jest"' in pkg_text) and jest_bin.exists():
+        return TestExecutionPlan(language="ts_js", runner_id="jest", targets=tuple(ts_targets))
+    if has_vitest_cfg or '"vitest"' in pkg_text or 'from "vitest"' in joined_src or "from 'vitest'" in joined_src:
+        _ensure_vitest_node_modules(worktree)
+        return TestExecutionPlan(language="ts_js", runner_id="vitest", targets=tuple(ts_targets))
+    if 'from "node:test"' in joined_src or "from 'node:test'" in joined_src or 'require("node:test")' in joined_src:
+        return TestExecutionPlan(language="ts_js", runner_id="node_test", targets=tuple(ts_targets))
+    _ensure_vitest_node_modules(worktree)
+    return TestExecutionPlan(language="ts_js", runner_id="vitest", targets=tuple(ts_targets))
 
 
 def select_test_runner(
@@ -655,6 +820,7 @@ def run_mutant_battery(
     total_budget_s: float = 120.0,
     started_at: float | None = None,
     test_cmd: tuple[str, ...] | None = None,
+    run_fn: Callable[[Path, float], ExecutionOutcome] | None = None,
 ) -> MutantBatteryReport:
     """Execute each mutant in its own fresh snapshot within the battery budget."""
     t_start = started_at if started_at is not None else time.monotonic()
@@ -662,18 +828,33 @@ def run_mutant_battery(
     scope_counts: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     deadline = t_start + total_budget_s
     budget_interrupted = False
+    base_bytes_cache: dict[str, bytes] = {}
     for mutant in mutants:
         if deadline - time.monotonic() <= 0.5:
             break
 
+        if mutant.patch is not None and mutant.rel_path not in base_bytes_cache:
+            orig_file = worktree / mutant.rel_path
+            if orig_file.is_file():
+                base_bytes_cache[mutant.rel_path] = orig_file.read_bytes()
+
         with temporary_snapshot(worktree) as snapshot:
-            (snapshot / mutant.rel_path).write_text(mutant.mutated_source, encoding='utf-8')
+            target_file = snapshot / mutant.rel_path
+            if mutant.patch is not None and mutant.rel_path in base_bytes_cache:
+                target_file.write_bytes(materialize_mutant_bytes(base_bytes_cache[mutant.rel_path], mutant))
+            else:
+                target_file.write_text(mutant.mutated_source, encoding='utf-8')
             dispatch_at = time.monotonic()
             remaining = deadline - dispatch_at
             if remaining <= 0:
                 break
-            outcome = run_test_command(snapshot, runner_mode, targets,
-                                       timeout_s=min(per_mutant_timeout_s, remaining), test_cmd=test_cmd)
+            eff_timeout = min(per_mutant_timeout_s, remaining)
+            if run_fn is not None:
+                outcome = run_fn(snapshot, eff_timeout)
+            else:
+                outcome = run_test_command(
+                    snapshot, runner_mode, targets, timeout_s=eff_timeout, test_cmd=test_cmd
+                )
             observed_at = time.monotonic()
 
         status = _timed_mutation_status(

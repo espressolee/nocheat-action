@@ -16,18 +16,57 @@ from ..tier0_syntax import (
     analyze_python_test_diff,
     is_test_suite_degraded,
 )
-from .base import LanguageAnalysisResult, OracleRegistry
+from .base import LanguageAnalysisResult, OracleRegistry, TestExecutionPlan
 from .ts_js import _TS_EXTENSIONS, analyze_ts_js_diff, is_ts_js_path
 
 
 class PythonLanguageOracle:
-    """M1 Open-Core Python diff-scoped AST mutation & Tier-0 soundness oracle."""
+    """M1 Open-Core Python diff-scoped AST mutation, discovery, and runner pack."""
 
     language: str = "python"
     supported_extensions: tuple[str, ...] = (".py",)
 
     def matches_path(self, rel_path: str) -> bool:
         return rel_path.endswith(".py")
+
+    def prepare_workspace(self, host_repo_dir: Path, isolated_worktree: Path) -> None:
+        return None
+
+    def discover_tests(
+        self,
+        isolated_worktree: Path,
+        scope: DiffScope,
+        analysis: LanguageAnalysisResult,
+        *,
+        test_cmd: tuple[str, ...] | None = None,
+    ) -> TestExecutionPlan:
+        from ..runner import discover_python_plan
+
+        return discover_python_plan(
+            isolated_worktree,
+            scope,
+            analysis.prod_scopes or tuple(s for s in scope.prod_scopes if self.matches_path(s.rel_path)),
+            analysis.callee_fallback_scopes or tuple(s for s in scope.callee_fallback_scopes if self.matches_path(s.rel_path)),
+            test_cmd=test_cmd,
+        )
+
+    def run_tests(
+        self,
+        isolated_worktree: Path,
+        plan: TestExecutionPlan,
+        *,
+        timeout_s: float = 5.0,
+        test_cmd: tuple[str, ...] | None = None,
+    ):
+        from ..runner import run_test_command
+
+        return run_test_command(
+            isolated_worktree,
+            plan.runner_id,
+            list(plan.targets),
+            timeout_s=timeout_s,
+            test_cmd=test_cmd if plan.runner_id == "custom" else None,
+        )
 
     def analyze_diff(
         self,
@@ -86,6 +125,45 @@ class TsJsLanguageOracle:
 
     def matches_path(self, rel_path: str) -> bool:
         return is_ts_js_path(rel_path)
+
+    def prepare_workspace(self, host_repo_dir: Path, isolated_worktree: Path) -> None:
+        from ..runner import prepare_ts_js_workspace
+
+        prepare_ts_js_workspace(host_repo_dir, isolated_worktree)
+
+    def discover_tests(
+        self,
+        isolated_worktree: Path,
+        scope: DiffScope,
+        analysis: LanguageAnalysisResult,
+        *,
+        test_cmd: tuple[str, ...] | None = None,
+    ) -> TestExecutionPlan:
+        from ..runner import discover_ts_js_plan
+
+        return discover_ts_js_plan(
+            isolated_worktree,
+            scope,
+            analysis.prod_scopes,
+            analysis.callee_fallback_scopes,
+        )
+
+    def run_tests(
+        self,
+        isolated_worktree: Path,
+        plan: TestExecutionPlan,
+        *,
+        timeout_s: float = 5.0,
+        test_cmd: tuple[str, ...] | None = None,
+    ):
+        from ..runner import run_test_command
+
+        return run_test_command(
+            isolated_worktree,
+            plan.runner_id,
+            list(plan.targets),
+            timeout_s=timeout_s,
+        )
 
     def analyze_diff(
         self,
