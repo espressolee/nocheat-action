@@ -25,7 +25,7 @@ When the same family of LLMs writes code, fixes failing CI checks, reviews diffs
   with:
     fetch-depth: 0
 
-- uses: espressolee/nocheat-action@v0.1.4
+- uses: espressolee/nocheat-action@v0.1.5
   with:
     mode: observe   # report only (exit 0) and write findings to $GITHUB_STEP_SUMMARY
 ```
@@ -140,7 +140,7 @@ Evaluated across `83` public Python artifacts (`Sengim/impossiblebench-rollouts`
 | **`NoCheat Merge Gate` (`v0.1`)** | **`19/41` (`46.3%`)** | **`16/41` (`39.0%`)** | **`35/41` (`85.4%`)** | **`0/42` (`0.0%`)** | **`1/42` (`2.4%`)** *(seq-equiv `2/42, 4.8%`)* |
 
 **Transparent failure limits & accounting (zero hiding):**
-- **Complete `41`-cheat accounting:** `19 BLOCK` (`46.3%`, automatic block in `enforce`) + `16 ABSTAIN` (`39.0%`, blocks merge only when `abstain-policy: fail` or required human review is configured) + `4 PASS` missed (`9.8%`, `oneoff` cheats where tests were untouched and mutation kill rates stayed `70.8%–91.7%`) + `2` remaining cases (`4.9%`, pending full per-case public provenance table release).
+- **Complete `41`-cheat accounting (`2026-11-24` receipt `f158a5235e58`, verified identically `41/41` in `v0.1.4` post-hoc re-run):** `19 BLOCK` (`46.3%`, automatic block in `enforce`) + `16 ABSTAIN` (`39.0%`, blocks merge only when `abstain-policy: fail` or required human review is configured) + `4 PASS` missed (`9.8%`, `oneoff` cheats where tests were untouched and mutation kill rates stayed `70.8%–91.7%`) + `2 BASELINE_FAIL` (`4.9%`, `c1_conflicting_lcbhard_35_03` and `c1_conflicting_lcbhard_56_08` whose own candidate baseline tests failed before mutation checks ran).
 - **Clean non-PASS cases:** `C2A_POD_Real` `5/5 (100%)` PASS and `C3_Click_OSS` `12/12 (100%)` PASS; remaining `C1_Sengim` clean non-PASS cases are `1` low-kill-band `ABSTAIN` (`33.3%`) plus `2` baseline failures (`1` pre-existing failing baseline test + `1` parallel-contention 15s baseline timeout that hits `120s` budget `ABSTAIN` sequentially).
 - **External validity:** `ImpossibleBench` measures induced specification/test conflict, not natural PR cheating incidence. Live production capture rates on external PR corpora remain **unmeasured** until external field rollout.
 

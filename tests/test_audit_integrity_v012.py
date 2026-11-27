@@ -294,3 +294,58 @@ def test_deterministic_concurrency_trace_and_replay_cli(tmp_path: Path, capsys):
         cli_main(["replay-concurrency", "--repo", str(repo)])  # missing required --trace
     assert exc_info.value.code == 2
     assert capsys.readouterr().out.strip() == ""
+
+
+def test_ts_js_monorepo_subpackage_vitest_single_quote_node_test_and_missing_runner_abstain(tmp_path: Path):
+    from nocheat_gate.diff_scope import DiffScope, FileDiffSummary
+    from nocheat_gate.runner import (
+        discover_ts_js_plan,
+        prepare_ts_js_workspace,
+        run_test_command,
+    )
+
+    # M-1: Single-quoted require('node:test') selects node_test (not vitest)
+    wt_node = tmp_path / "wt_node"
+    (wt_node / "test").mkdir(parents=True)
+    (wt_node / "index.js").write_text("module.exports = (x) => x + 1;\n", encoding="utf-8")
+    (wt_node / "test" / "index.test.js").write_text(
+        "const { test } = require('node:test');\n"
+        "const assert = require('node:assert');\n"
+        "const inc = require('../index');\n"
+        "test('inc', () => assert.strictEqual(inc(1), 2));\n",
+        encoding="utf-8",
+    )
+    scope_node = DiffScope(
+        base_ref="HEAD~1",
+        head_ref="HEAD",
+        prod_files=(FileDiffSummary("index.js", "M", frozenset({1}), frozenset(), False),),
+        test_files=(FileDiffSummary("test/index.test.js", "M", frozenset({1}), frozenset(), False),),
+        prod_scopes=(),
+        callee_fallback_scopes=(),
+    )
+    plan_node = discover_ts_js_plan(wt_node, scope_node, (), ())
+    assert plan_node.runner_id == "node_test"
+
+    # M-2: pnpm workspace subpackage library/node_modules/.bin/vitest mounted & discovered
+    host = tmp_path / "host_monorepo"
+    wt_mono = tmp_path / "wt_monorepo"
+    (host / "library" / "node_modules" / ".bin").mkdir(parents=True)
+    fake_vitest = host / "library" / "node_modules" / ".bin" / "vitest"
+    fake_vitest.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_vitest.chmod(0o755)
+    (wt_mono / "library" / "src").mkdir(parents=True)
+    (wt_mono / "library" / "src" / "a.test.ts").write_text("import { test } from 'vitest';\n", encoding="utf-8")
+    prepare_ts_js_workspace(host, wt_mono)
+    assert (wt_mono / "library" / "node_modules" / ".bin" / "vitest").exists()
+    out_ok = run_test_command(wt_mono, "vitest", ["library/src/a.test.ts"], timeout_s=5.0)
+    assert out_ok.passed is True
+
+    # M-3: Missing vitest binary returns launch rc=127 TS_RUNNER_UNAVAILABLE (not FileNotFoundError crash)
+    wt_missing = tmp_path / "wt_missing"
+    (wt_missing / "src").mkdir(parents=True)
+    (wt_missing / "src" / "a.test.ts").write_text("import { test } from 'vitest';\n", encoding="utf-8")
+    out_miss = run_test_command(wt_missing, "vitest", ["src/a.test.ts"], timeout_s=5.0)
+    assert out_miss.passed is False
+    assert out_miss.returncode == 127
+    assert "TS_RUNNER_UNAVAILABLE" in out_miss.output_tail
+    assert out_miss.diagnosis is not None and out_miss.diagnosis["stage"] == "launch"

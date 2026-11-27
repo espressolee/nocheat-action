@@ -279,7 +279,7 @@ def prepare_ts_js_workspace(
                 except OSError:
                     pass
 
-    # Also symlink package-local `node_modules` for changed monorepo subpackages when present
+    # Also symlink package-local `node_modules` for monorepo subpackages (e.g. pnpm workspaces)
     seen_dirs: set[Path] = set()
     for rel in changed_rel_paths:
         p = Path(rel)
@@ -291,6 +291,20 @@ def prepare_ts_js_workspace(
             wt_sub_dir = worktree / parent
             wt_sub_nm = wt_sub_dir / "node_modules"
             if host_sub_nm.is_dir() and wt_sub_dir.is_dir() and not wt_sub_nm.exists() and not wt_sub_nm.is_symlink():
+                try:
+                    os.symlink(host_sub_nm, wt_sub_nm)
+                except OSError:
+                    pass
+
+    # Scan depth-1 and depth-2 workspace subpackages (e.g. library/node_modules, packages/*/node_modules)
+    for depth_pat in ("*/node_modules", "*/*/node_modules"):
+        for host_sub_nm in resolved_host.glob(depth_pat):
+            if not host_sub_nm.is_dir() or "node_modules" in host_sub_nm.relative_to(resolved_host).parts[:-1]:
+                continue
+            rel_parent = host_sub_nm.parent.relative_to(resolved_host)
+            wt_sub_dir = worktree / rel_parent
+            wt_sub_nm = wt_sub_dir / "node_modules"
+            if wt_sub_dir.is_dir() and not wt_sub_nm.exists() and not wt_sub_nm.is_symlink():
                 try:
                     os.symlink(host_sub_nm, wt_sub_nm)
                 except OSError:
@@ -354,6 +368,45 @@ def discover_python_plan(
     return TestExecutionPlan(language="python", runner_id="pytest", targets=())
 
 
+def _find_ts_js_package_dir(worktree: Path, targets: list[str], bin_name: str) -> tuple[Path, Path | None]:
+    """Locate closest enclosing package directory & runner binary for monorepo TS/JS targets."""
+    if targets:
+        # Walk up from first target's directory toward worktree root looking for local node_modules/.bin/<bin_name>
+        cur = (worktree / targets[0]).parent
+        wt_res = worktree.resolve()
+        while True:
+            cand = cur / "node_modules" / ".bin" / bin_name
+            if cand.exists():
+                # Only switch cwd to subpackage if ALL targets live inside `cur`
+                if all((worktree / t).resolve().is_relative_to(cur.resolve()) for t in targets):
+                    return cur, cand
+                return worktree, cand
+            if cur.resolve() == wt_res or cur == cur.parent:
+                break
+            cur = cur.parent
+    root_bin = worktree / "node_modules" / ".bin" / bin_name
+    if root_bin.exists():
+        return worktree, root_bin
+    shared_bin = _SHARED_NODE_MODULES / ".bin" / bin_name
+    if shared_bin.exists():
+        return worktree, shared_bin
+    return worktree, None
+
+
+def _uses_node_test(src: str) -> bool:
+    return any(
+        tok in src
+        for tok in (
+            'from "node:test"',
+            "from 'node:test'",
+            'require("node:test")',
+            "require('node:test')",
+            'import("node:test")',
+            "import('node:test')",
+        )
+    )
+
+
 def discover_ts_js_plan(
     worktree: Path,
     scope: DiffScope,
@@ -369,14 +422,16 @@ def discover_ts_js_plan(
         return TestExecutionPlan(language="ts_js", runner_id="vitest", targets=())
 
     pkg_text = ""
-    pkg = worktree / "package.json"
-    if pkg.exists():
-        pkg_text = pkg.read_text(encoding="utf-8", errors="ignore")
+    for pkg in (worktree / "package.json", (worktree / ts_targets[0]).parent / "package.json"):
+        if pkg.exists():
+            pkg_text += "\n" + pkg.read_text(encoding="utf-8", errors="ignore")
     joined_src = "\n".join(
         (worktree / t).read_text(encoding="utf-8", errors="ignore")[:1000]
         for t in ts_targets
         if (worktree / t).exists()
     )
+    if _uses_node_test(joined_src):
+        return TestExecutionPlan(language="ts_js", runner_id="node_test", targets=tuple(ts_targets))
     has_jest_cfg = any(
         (worktree / f).exists()
         for f in ("jest.config.js", "jest.config.ts", "jest.config.mjs", "jest.config.cjs")
@@ -385,14 +440,13 @@ def discover_ts_js_plan(
         (worktree / f).exists()
         for f in ("vitest.config.ts", "vitest.config.js", "vitest.config.mts")
     )
-    jest_bin = worktree / "node_modules" / ".bin" / "jest"
-    if (has_jest_cfg or '"jest"' in pkg_text) and jest_bin.exists():
+    _, jest_bin = _find_ts_js_package_dir(worktree, ts_targets, "jest")
+    if (has_jest_cfg or '"jest"' in pkg_text) and jest_bin is not None:
         return TestExecutionPlan(language="ts_js", runner_id="jest", targets=tuple(ts_targets))
-    if has_vitest_cfg or '"vitest"' in pkg_text or 'from "vitest"' in joined_src or "from 'vitest'" in joined_src:
+    _, vitest_bin = _find_ts_js_package_dir(worktree, ts_targets, "vitest")
+    if has_vitest_cfg or '"vitest"' in pkg_text or 'from "vitest"' in joined_src or "from 'vitest'" in joined_src or vitest_bin is not None:
         _ensure_vitest_node_modules(worktree)
         return TestExecutionPlan(language="ts_js", runner_id="vitest", targets=tuple(ts_targets))
-    if 'from "node:test"' in joined_src or "from 'node:test'" in joined_src or 'require("node:test")' in joined_src:
-        return TestExecutionPlan(language="ts_js", runner_id="node_test", targets=tuple(ts_targets))
     _ensure_vitest_node_modules(worktree)
     return TestExecutionPlan(language="ts_js", runner_id="vitest", targets=tuple(ts_targets))
 
@@ -528,6 +582,7 @@ def run_test_command(
             output_tail="NO_TEST_TARGETS_SELECTED",
             diagnosis=diagnose_execution(stage="selection", returncode=2, runner_mode=runner_mode),
         )
+    exec_cwd = worktree
     if test_cmd is not None:
         cmd = list(test_cmd)
     elif runner_mode == "script":
@@ -535,11 +590,43 @@ def run_test_command(
     elif runner_mode == "pytest":
         cmd = [sys.executable, "-B", "-m", "pytest", "-x", "-q", "--no-header", "--tb=line", *targets]
     elif runner_mode == "vitest":
-        local_bin = worktree / "node_modules" / ".bin" / "vitest"
-        vitest_bin = str(local_bin if local_bin.exists() else (_SHARED_NODE_MODULES / ".bin" / "vitest"))
-        cmd = [vitest_bin, "run", "--bail", "1", *targets]
+        pkg_cwd, vbin = _find_ts_js_package_dir(worktree, targets, "vitest")
+        if vbin is None:
+            return ExecutionOutcome(
+                passed=False,
+                timed_out=False,
+                elapsed_s=0.0,
+                returncode=127,
+                output_tail="TS_RUNNER_UNAVAILABLE: vitest binary not found in repo or subpackage node_modules",
+                diagnosis=diagnose_execution(stage="launch", returncode=127, stderr="vitest binary not found", runner_mode=runner_mode),
+            )
+        exec_cwd = pkg_cwd
+        rel_targets = [
+            str((worktree / t).resolve().relative_to(pkg_cwd.resolve()))
+            if pkg_cwd != worktree
+            else t
+            for t in targets
+        ]
+        cmd = [str(vbin), "run", "--bail", "1", *rel_targets]
     elif runner_mode == "jest":
-        cmd = [str(worktree / "node_modules" / ".bin" / "jest"), "--bail", "--runTestsByPath", *targets]
+        pkg_cwd, jbin = _find_ts_js_package_dir(worktree, targets, "jest")
+        if jbin is None:
+            return ExecutionOutcome(
+                passed=False,
+                timed_out=False,
+                elapsed_s=0.0,
+                returncode=127,
+                output_tail="TS_RUNNER_UNAVAILABLE: jest binary not found in repo or subpackage node_modules",
+                diagnosis=diagnose_execution(stage="launch", returncode=127, stderr="jest binary not found", runner_mode=runner_mode),
+            )
+        exec_cwd = pkg_cwd
+        rel_targets = [
+            str((worktree / t).resolve().relative_to(pkg_cwd.resolve()))
+            if pkg_cwd != worktree
+            else t
+            for t in targets
+        ]
+        cmd = [str(jbin), "--bail", "--runTestsByPath", *rel_targets]
     elif runner_mode == "node_test":
         cmd = [shutil.which("node") or "node", "--test", *targets]
     else:
@@ -556,7 +643,7 @@ def run_test_command(
     try:
         proc = subprocess.run(
             cmd,
-            cwd=str(worktree),
+            cwd=str(exec_cwd),
             env=_build_env(worktree),
             capture_output=True,
             encoding='utf-8',

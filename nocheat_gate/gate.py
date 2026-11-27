@@ -425,11 +425,23 @@ def _evaluate_pr_pair(
             baseline = _exec_baseline(baseline_tree, effective_baseline_timeout)
         if not baseline.passed:
             elapsed = time.monotonic() - t0
-            msg = (f"BASELINE_TESTS_FAILED: rc={baseline.returncode} {baseline.output_tail[:200]}",)
+            is_launch_missing = (
+                isinstance(baseline.diagnosis, dict)
+                and baseline.diagnosis.get("stage") == "launch"
+                and baseline.returncode == 127
+                and runner_mode in ("vitest", "jest", "node_test")
+            )
+            fail_verdict = "ABSTAIN" if is_launch_missing else "BASELINE_FAIL"
+            tail_s = baseline.output_tail[:200]
+            msg = (
+                (tail_s if tail_s.startswith("TS_RUNNER_UNAVAILABLE") else f"TS_RUNNER_UNAVAILABLE: {tail_s}",)
+                if is_launch_missing
+                else (f"BASELINE_TESTS_FAILED: rc={baseline.returncode} {tail_s}",)
+            )
             return (
                 GateResult(
                     arm="MutationOnly",
-                    verdict="BASELINE_FAIL",
+                    verdict=fail_verdict,
                     reasons=msg,
                     baseline_execution=baseline.diagnosis,
                     total_mutants=len(lang_mutants),
@@ -446,7 +458,7 @@ def _evaluate_pr_pair(
                 ),
                 GateResult(
                     arm="NoCheatGate",
-                    verdict="BASELINE_FAIL",
+                    verdict=fail_verdict,
                     reasons=msg,
                     baseline_execution=baseline.diagnosis,
                     total_mutants=len(lang_mutants),
